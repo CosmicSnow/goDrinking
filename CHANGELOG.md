@@ -1,5 +1,9 @@
 # changelog
 
+## v0.7.21
+
+- test: `e2e-webcam.py` usa o fluxo real (viewer só inicia após o código da sala) + settle de teardown entre modos; dois boots WebView simultâneos travavam o host pré-sala nesta máquina
+
 ## v0.7.20
 
 - fix: webcam macOS em pipeline AVFoundation nativo (remove nokhwa do backend macOS) — delegate com entrega por callback, BGRA com stride padding, autorização por start sem prompt na enumeração

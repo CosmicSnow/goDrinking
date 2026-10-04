@@ -104,8 +104,27 @@ def run_mode(binary, art, mode, share, quality, timeout, password="webcam-e2e-lo
                        "status_file": str(art / f"{mode}-viewer.json")}
         host_proc = procs.launch([str(binary), "--e2e-plan", json.dumps(host_plan)],
                                  f"{mode}-host", {"GOLIVE_TRACE_DIR": str(art / f"{mode}-host-trace")})
-        viewer_proc = procs.launch([str(binary), "--e2e-plan", json.dumps(viewer_plan)],
-                                   f"{mode}-viewer", {"GOLIVE_TRACE_DIR": str(art / f"{mode}-viewer-trace")})
+        # The guest joins with the code in hand in real usage — and two
+        # Tauri/WebView boots at the same instant starve each other on this
+        # machine (host never reaches create_room). Wait for the room code
+        # before booting the viewer.
+        verdict = None
+        code_path = art / f"{mode}-code"
+        code_deadline = time.monotonic() + 60
+        while not code_path.exists():
+            if host_proc.poll() is not None:
+                verdict = "host-exited-before-room"
+                break
+            if time.monotonic() > code_deadline:
+                verdict = "room-code-never-published"
+                break
+            time.sleep(0.5)
+        else:
+            viewer_proc = procs.launch([str(binary), "--e2e-plan", json.dumps(viewer_plan)],
+                                       f"{mode}-viewer", {"GOLIVE_TRACE_DIR": str(art / f"{mode}-viewer-trace")})
+        if verdict is not None:
+            detail["verdict"] = verdict
+            return verdict == "pass", detail
         deadline = time.monotonic() + timeout
         verdict = None
         latched_host = False
@@ -163,6 +182,10 @@ def main():
     parser.add_argument("--quality", default="720p", choices=("720p", "1080p"))
     parser.add_argument("--only", nargs="*", choices=("combo", "screen", "camera"),
                         help="run only these modes (camera still needs its probe to resolve the id)")
+    parser.add_argument("--settle-s", type=int, default=15,
+                        help="quiet seconds between modes so MF/DXGI/WebView2 teardown "
+                             "settles before the next host boots (a fresh boot right after "
+                             "terminate() can stall pre-room)")
     args = parser.parse_args()
     art = args.artifact.resolve()
     art.mkdir(parents=True, exist_ok=False)
@@ -192,6 +215,9 @@ def main():
     modes = []
     # Combo needs a working camera id; resolve it first (also covers mode 3).
     cid = resolve_camera()
+    if args.settle_s > 0:
+        print(f"settling {args.settle_s}s after probe (driver/WebView teardown)...", flush=True)
+        time.sleep(args.settle_s)
     if cid is None:
         modes.append(("combo", None))
         modes.append(("screen", f"display:{args.display}"))
@@ -214,6 +240,9 @@ def main():
             continue
         ok, detail = run_mode(args.binary, art, mode, share, quality, args.timeout_s)
         results.append(detail)
+        if args.settle_s > 0:
+            print(f"settling {args.settle_s}s (driver/WebView teardown)...", flush=True)
+            time.sleep(args.settle_s)
     passed = all(r.get("verdict") == "pass" for r in results if not r["mode"].startswith("probe-"))
     # Probes that found nothing are informational; a probe that passed is evidence.
     report = {"passed": passed, "binary": str(args.binary), "quality": quality, "modes": results}
