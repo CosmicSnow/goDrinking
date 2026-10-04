@@ -135,8 +135,7 @@ fn parse_product_version(text: &str) -> Option<(u32, u32)> {
 /// NSError → typed error. Only domain + code travel (never message text —
 /// system strings stay out of logs by policy).
 fn map_ns_error(domain: &str, code: i32) -> PlatformError {
-    if domain.contains("ScreenCaptureKit")
-        && (code == SC_USER_DECLINED || code == SC_TCC_DECLINED)
+    if domain.contains("ScreenCaptureKit") && (code == SC_USER_DECLINED || code == SC_TCC_DECLINED)
     {
         return PlatformError::permission_denied();
     }
@@ -157,10 +156,9 @@ fn ns_error_parts(error: &NSError) -> (String, i32) {
     (error.domain().to_string(), error.code() as i32)
 }
 
-/// List capture targets on this Mac. Empty on a real desktop means denial
-/// hid the content (a Mac without any display or window is not a real
-/// case), so empty maps to `PermissionDenied`, not to an empty UI.
-pub fn enumerate() -> Result<Vec<SourceInfo>, PlatformError> {
+/// Enumerate screen capture targets only. Kept independent from AVFoundation
+/// so a camera selection never performs ScreenCaptureKit authorization work.
+fn enumerate_screen_sources() -> Result<Vec<SourceInfo>, PlatformError> {
     let content = shareable_content()?;
     let mut out = Vec::new();
     unsafe {
@@ -196,14 +194,54 @@ pub fn enumerate() -> Result<Vec<SourceInfo>, PlatformError> {
             });
         }
     }
-    // Webcams degrade to absent on query failure; a camera-only list is a
-    // real state (screen-denied Macs can still stream webcam). The
-    // denied-vs-empty verdict applies to the combined list.
-    out.extend(camera::enumerate_cameras());
     if out.is_empty() {
         return Err(PlatformError::permission_denied());
     }
     Ok(out)
+}
+
+/// Enumerate one capture permission domain without touching the other.
+pub fn enumerate_kind(kind: SourceKind) -> Result<Vec<SourceInfo>, PlatformError> {
+    enumerate_kind_with(
+        kind,
+        || enumerate_screen_sources(),
+        || camera::enumerate_cameras(),
+    )
+}
+
+fn enumerate_kind_with(
+    kind: SourceKind,
+    screen: impl FnOnce() -> Result<Vec<SourceInfo>, PlatformError>,
+    cameras: impl FnOnce() -> Vec<SourceInfo>,
+) -> Result<Vec<SourceInfo>, PlatformError> {
+    match kind {
+        SourceKind::Camera => Ok(cameras()),
+        SourceKind::Display | SourceKind::Window => Ok(screen()?
+            .into_iter()
+            .filter(|source| source.kind == kind)
+            .collect()),
+    }
+}
+
+/// List all available targets. A screen-permission denial does not hide
+/// discoverable webcams; unrelated SCK failures are still surfaced.
+pub fn enumerate() -> Result<Vec<SourceInfo>, PlatformError> {
+    enumerate_with(enumerate_screen_sources, camera::enumerate_cameras)
+}
+
+fn enumerate_with(
+    screen: impl FnOnce() -> Result<Vec<SourceInfo>, PlatformError>,
+    cameras: impl FnOnce() -> Vec<SourceInfo>,
+) -> Result<Vec<SourceInfo>, PlatformError> {
+    let cameras = cameras();
+    match screen() {
+        Ok(mut screens) => {
+            screens.extend(cameras);
+            Ok(screens)
+        }
+        Err(PlatformError::PermissionDenied { .. }) if !cameras.is_empty() => Ok(cameras),
+        Err(error) => Err(error),
+    }
 }
 
 /// Blocking shareable-content fetch with deadline. Errors map typed;
@@ -250,24 +288,26 @@ fn shareable_content() -> Result<Retained<SCShareableContent>, PlatformError> {
 /// never reach logs.
 #[allow(deprecated)] // deprecated for capture; still the one-shot still API.
 pub fn thumbnail(kind: SourceKind, id: &str) -> Result<BgraFrame, PlatformError> {
-    // Webcams grab via AVFoundation (own thread-neutral path, no SCK/CG).
+    // Do not open a camera from a one-shot thumbnail pull: modal thumbnails
+    // may be automatic, while AVFoundation permission is gesture-scoped.
     if matches!(kind, SourceKind::Camera) {
-        let id = id.trim();
-        if id.is_empty() {
-            return Err(PlatformError::InvalidSource { reason: "id vazio" });
-        }
-        return camera::thumbnail_camera(id);
+        let _ = id;
+        return Err(PlatformError::Internal(
+            "prévia de webcam requer fluxo explícito".into(),
+        ));
     }
     use objc2_core_graphics::{
-        CGDataProvider, CGDisplayBounds, CGImageGetBitsPerComponent, CGImageGetBitsPerPixel,
-        CGImageGetBytesPerRow, CGImageGetDataProvider, CGImageGetHeight, CGImageGetWidth,
-        CGWindowImageOption, CGWindowListCreateImage, CGWindowListOption, CGRectIsNull,
-        CGRectNull, kCGNullWindowID,
+        kCGNullWindowID, CGDataProvider, CGDisplayBounds, CGImageGetBitsPerComponent,
+        CGImageGetBitsPerPixel, CGImageGetBytesPerRow, CGImageGetDataProvider, CGImageGetHeight,
+        CGImageGetWidth, CGRectIsNull, CGRectNull, CGWindowImageOption, CGWindowListCreateImage,
+        CGWindowListOption,
     };
-    let window_id: u32 =
-        id.trim()
-            .parse()
-            .map_err(|_| PlatformError::InvalidSource { reason: "id de fonte inválido" })?;
+    let window_id: u32 = id
+        .trim()
+        .parse()
+        .map_err(|_| PlatformError::InvalidSource {
+            reason: "id de fonte inválido",
+        })?;
     // SAFETY: plain CoreGraphics C calls. Every pointer is null-checked
     // (Option returns), every read is exact-size (dims/stride come from the
     // getters below), and the pixel copy outlives nothing: bytes are copied
@@ -321,8 +361,10 @@ pub fn thumbnail(kind: SourceKind, id: &str) -> Result<BgraFrame, PlatformError>
         let bytes = std::slice::from_raw_parts(data.byte_ptr(), len);
         // Tight copy honoring provider stride (row padding dropped).
         let mut pixels = vec![0u8; w * h * 4];
-        for (dst_row, src_row) in
-            pixels.chunks_exact_mut(w * 4).zip(bytes.chunks(stride)).take(h)
+        for (dst_row, src_row) in pixels
+            .chunks_exact_mut(w * 4)
+            .zip(bytes.chunks(stride))
+            .take(h)
         {
             dst_row.copy_from_slice(&src_row[..w * 4]);
         }
@@ -341,52 +383,29 @@ impl VideoSource for ScSource {
         enumerate()
     }
 
+    fn enumerate_kind(kind: SourceKind) -> Result<Vec<SourceInfo>, PlatformError> {
+        enumerate_kind(kind)
+    }
+
     fn open(info: &SourceInfo) -> Result<Self, PlatformError> {
         Self::validated(info)
     }
-}
 
-/// Webcam start: validate against a fresh listing, then pump AVFoundation
-/// frames on a worker with the same rendezvous shape as SCK start.
-fn start_camera(info: &SourceInfo, config: &CaptureConfig) -> Result<FrameStream, PlatformError> {
-    let listed = enumerate()?;
-    if listed.iter().all(|item| item.kind != info.kind || item.id != info.id) {
-        return Err(PlatformError::SourceGone { id: info.id.clone() });
-    }
-    let id = info.id.clone();
-    let config = *config;
-    let (ready_tx, ready_rx) = mpsc::channel::<Result<(), PlatformError>>();
-    let (frame_tx, frame_rx) = mpsc::sync_channel::<CapturePacket>(CHANNEL_DEPTH);
-    let error: Arc<Mutex<Option<PlatformError>>> = Arc::new(Mutex::new(None));
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let error_ = Arc::clone(&error);
-    let stop_ = Arc::clone(&stop_flag);
-    let worker = std::thread::Builder::new()
-        .name("golive-avf".into())
-        .spawn(move || {
-            camera::run_camera(id, config, frame_tx, stop_, error_, ready_tx);
-        })
-        .map_err(|e| PlatformError::Internal(format!("thread de captura: {e}")))?;
-    match ready_rx.recv_timeout(START_DEADLINE) {
-        Ok(Ok(())) => Ok(FrameStream::new(frame_rx, error, stop_flag, worker)),
-        Ok(Err(error)) => {
-            stop_flag.store(true, Ordering::Release);
-            let _ = worker.join();
-            Err(error)
-        }
-        Err(_) => {
-            stop_flag.store(true, Ordering::Release);
-            let _ = worker.join();
-            Err(PlatformError::Internal("timeout ao iniciar captura".into()))
-        }
-    }
-}
-
-impl VideoSource for ScSource {
     fn start(&mut self, config: &CaptureConfig) -> Result<FrameStream, PlatformError> {
-        // Webcams bypass SCK entirely (AVFoundation pump, own worker).
+        self.start_with_cancel(config, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn start_with_cancel(
+        &mut self,
+        config: &CaptureConfig,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<FrameStream, PlatformError> {
+        // Webcams bypass SCK entirely (AVFoundation delegate, owned worker).
         if matches!(self.info.kind, SourceKind::Camera) {
-            return start_camera(&self.info, config);
+            return camera::start_camera(&self.info, config, cancel);
+        }
+        if cancel.load(Ordering::Acquire) {
+            return Err(PlatformError::Internal("captura cancelada".into()));
         }
         let info = self.info.clone();
         let config = *config;
@@ -403,11 +422,21 @@ impl VideoSource for ScSource {
         let worker = std::thread::Builder::new()
             .name("golive-sck".into())
             .spawn(move || {
-                run_capture(info, config, frame_tx, error_, stop_, ready_tx, worker_probe);
+                run_capture(
+                    info,
+                    config,
+                    frame_tx,
+                    error_,
+                    stop_,
+                    ready_tx,
+                    worker_probe,
+                );
             })
             .map_err(|e| PlatformError::Internal(format!("thread de captura: {e}")))?;
         match ready_rx.recv_timeout(START_DEADLINE) {
-            Ok(Ok(())) => Ok(FrameStream::new(frame_rx, error, stop_flag, worker).with_capture_probe(probe)),
+            Ok(Ok(())) => {
+                Ok(FrameStream::new(frame_rx, error, stop_flag, worker).with_capture_probe(probe))
+            }
             Ok(Err(error)) => {
                 stop_flag.store(true, Ordering::Release);
                 let _ = worker.join();
@@ -454,7 +483,10 @@ struct OutputIvars {
 fn now_ns() -> u64 {
     use std::sync::OnceLock;
     static T0: OnceLock<Instant> = OnceLock::new();
-    T0.get_or_init(Instant::now).elapsed().as_nanos().min(u64::MAX as u128) as u64
+    T0.get_or_init(Instant::now)
+        .elapsed()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
 }
 
 /// Cadence gate: accept only when `interval_ns` elapsed since the last
@@ -499,7 +531,11 @@ define_class!(
             let ivars = self.ivars();
             let now = now_ns();
             ivars.probe.arrival(now);
-            if !gate_open(ivars.last_ns.load(Ordering::Relaxed), now, ivars.interval_ns) {
+            if !gate_open(
+                ivars.last_ns.load(Ordering::Relaxed),
+                now,
+                ivars.interval_ns,
+            ) {
                 ivars.probe.gate_dropped.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -520,8 +556,12 @@ define_class!(
                     None => {
                         ivars.probe.invalid.fetch_add(1, Ordering::Relaxed);
                         match frame_status::sample_status(sample_buffer) {
-                            Some(1) => { ivars.probe.idle.fetch_add(1, Ordering::Relaxed); },
-                            Some(2) => { ivars.probe.blank.fetch_add(1, Ordering::Relaxed); },
+                            Some(1) => {
+                                ivars.probe.idle.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Some(2) => {
+                                ivars.probe.blank.fetch_add(1, Ordering::Relaxed);
+                            }
                             _ => (),
                         }
                         return;
@@ -530,14 +570,18 @@ define_class!(
             };
             if let Ok(tx) = ivars.tx.lock() {
                 // Latest-only: drop newest (not oldest) when full.
-                if tx.try_send(packet).is_err() { ivars.probe.queue_dropped.fetch_add(1, Ordering::Relaxed); }
+                if tx.try_send(packet).is_err() {
+                    ivars.probe.queue_dropped.fetch_add(1, Ordering::Relaxed);
+                }
             }
             // Cadence accounts accepted frames even when the channel was
             // full: copies/retains stay capped at profile fps while the
             // core lags (never spins on a slow consumer).
             ivars.last_ns.store(
                 golive_platform::cadence::advance_capture_clock(
-                    ivars.last_ns.load(Ordering::Relaxed), now, ivars.interval_ns,
+                    ivars.last_ns.load(Ordering::Relaxed),
+                    now,
+                    ivars.interval_ns,
                 ),
                 Ordering::Relaxed,
             );
@@ -583,9 +627,7 @@ fn log_fallback_once() {
 /// `None` when the sample is not directly submittable (non-BGRA,
 /// non-IOSurface, or a failed retain) — the caller falls back to the CPU
 /// copy path. Never touches a pixel.
-fn retain_gpu_packet(
-    sample: &objc2_core_media::CMSampleBuffer,
-) -> Option<CapturePacket> {
+fn retain_gpu_packet(sample: &objc2_core_media::CMSampleBuffer) -> Option<CapturePacket> {
     // SAFETY: SCK screen output with a BGRA configuration always carries a
     // CVPixelBuffer; format + backing validated before retaining.
     unsafe {
@@ -630,9 +672,7 @@ unsafe extern "C-unwind" fn release_cv_pixel_buffer(ptr: *mut c_void) {
         return;
     }
     unsafe {
-        let Some(retained) =
-            Retained::<CVPixelBuffer>::from_raw(ptr as *mut CVPixelBuffer)
-        else {
+        let Some(retained) = Retained::<CVPixelBuffer>::from_raw(ptr as *mut CVPixelBuffer) else {
             return;
         };
         drop(retained);
@@ -654,6 +694,33 @@ fn extract_bgra(sample: &objc2_core_media::CMSampleBuffer) -> Option<BgraFrame> 
         // Toll-free: CVPixelBuffer IS-A CVImageBuffer. Validated by format
         // below before touching a byte.
         let pixel = &*(image.as_ref() as *const CVImageBuffer as *const CVPixelBuffer);
+        copy_locked_cv_pixel_buffer(pixel)
+    }
+}
+
+/// Materializes a retained [`GpuPixelBuffer`] into owned CPU pixels for the
+/// consumers that cannot use a retained buffer: the screen+webcam compositor
+/// (PiP overlay needs bytes) and the stage self-view tap (needs I420).
+/// Returns `None` (caller degrades: forward retained, skip tap) on any
+/// anomaly — a degraded frame beats a misinterpreted one. Shares the exact
+/// stride-aware locked copy below with the SCK fallback path; zero-copy
+/// forwarding elsewhere is untouched.
+pub fn materialize_gpu_buffer(gpu: &GpuPixelBuffer) -> Option<BgraFrame> {
+    let ptr = gpu.as_ptr();
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `ptr` is the live +1 CVPixelBuffer the capture backend retained
+    // (see `retain_gpu_packet`); borrowed read-only here, never stored, and
+    // the lock/unlock pairing lives inside the helper.
+    unsafe { copy_locked_cv_pixel_buffer(&*(ptr as *const CVPixelBuffer)) }
+}
+
+fn copy_locked_cv_pixel_buffer(pixel: &CVPixelBuffer) -> Option<BgraFrame> {
+    // SAFETY: plain CoreVideo C calls on a borrowed pixel buffer. Format and
+    // dims validated before touching; lock/unlock paired; the slice is
+    // exact-size and never outlives the lock.
+    unsafe {
         if CVPixelBufferGetPixelFormatType(pixel) != kCVPixelFormatType_32BGRA {
             return None;
         }
@@ -675,7 +742,10 @@ fn extract_bgra(sample: &objc2_core_media::CMSampleBuffer) -> Option<BgraFrame> 
                 .checked_add(w.checked_mul(4)?)?;
             let src = std::slice::from_raw_parts(base, bytes);
             let mut data = vec![0u8; bytes];
-            for (dst_row, src_row) in data.chunks_exact_mut(stride).zip(src.chunks(stride)).take(h)
+            for (dst_row, src_row) in data
+                .chunks_exact_mut(stride)
+                .zip(src.chunks(stride))
+                .take(h)
             {
                 dst_row[..w * 4].copy_from_slice(&src_row[..w * 4]);
             }
@@ -748,11 +818,7 @@ fn run_capture(
                         return;
                     }
                 };
-                match content
-                    .displays()
-                    .iter()
-                    .find(|d| d.displayID() == id)
-                {
+                match content.displays().iter().find(|d| d.displayID() == id) {
                     Some(display) => {
                         let empty: Retained<NSArray<SCWindow>> = NSArray::from_slice(&[]);
                         Some(SCContentFilter::initWithDisplay_excludingWindows(
@@ -762,7 +828,9 @@ fn run_capture(
                         ))
                     }
                     None => {
-                        fail(PlatformError::SourceGone { id: info.id.clone() });
+                        fail(PlatformError::SourceGone {
+                            id: info.id.clone(),
+                        });
                         return;
                     }
                 }
@@ -786,7 +854,9 @@ fn run_capture(
                         ))
                     }
                     None => {
-                        fail(PlatformError::SourceGone { id: info.id.clone() });
+                        fail(PlatformError::SourceGone {
+                            id: info.id.clone(),
+                        });
                         return;
                     }
                 }
@@ -794,7 +864,9 @@ fn run_capture(
             // Unreachable via start() (webcams take start_camera), kept as a
             // loud guard so a future caller can never SCK-capture a camera.
             SourceKind::Camera => {
-                fail(PlatformError::Internal("webcam usa o caminho AVFoundation".into()));
+                fail(PlatformError::Internal(
+                    "webcam usa o caminho AVFoundation".into(),
+                ));
                 return;
             }
         };
@@ -912,6 +984,76 @@ fn run_capture(
 mod tests {
     use super::*;
 
+    fn camera_fixture() -> SourceInfo {
+        SourceInfo {
+            kind: SourceKind::Camera,
+            id: "1".into(),
+            name: "Test camera".into(),
+            w: 1280,
+            h: 720,
+        }
+    }
+
+    fn display_fixture() -> SourceInfo {
+        SourceInfo {
+            kind: SourceKind::Display,
+            id: "42".into(),
+            name: "Test display".into(),
+            w: 1920,
+            h: 1080,
+        }
+    }
+
+    #[test]
+    fn camera_scoped_discovery_never_calls_screen_enumerator() {
+        let camera = camera_fixture();
+        let listed = enumerate_kind_with(
+            SourceKind::Camera,
+            || panic!("camera listing must not touch ScreenCaptureKit"),
+            || vec![camera.clone()],
+        )
+        .unwrap();
+        assert_eq!(listed, vec![camera.clone()]);
+    }
+
+    #[test]
+    fn combined_discovery_preserves_camera_on_screen_denial_only() {
+        let camera = camera_fixture();
+        let listed = enumerate_with(
+            || Err(PlatformError::permission_denied()),
+            || vec![camera.clone()],
+        )
+        .unwrap();
+        assert_eq!(listed, vec![camera.clone()]);
+
+        let error = enumerate_with(
+            || Err(PlatformError::Internal("screen failure".into())),
+            || vec![camera],
+        );
+        assert!(
+            matches!(error, Err(PlatformError::Internal(message)) if message == "screen failure")
+        );
+    }
+
+    #[test]
+    fn scoped_screen_discovery_filters_kind_and_preserves_errors() {
+        let listed = enumerate_kind_with(
+            SourceKind::Display,
+            || Ok(vec![display_fixture(), camera_fixture()]),
+            || panic!("screen listing must not discover cameras"),
+        )
+        .unwrap();
+        assert_eq!(listed, vec![display_fixture()]);
+        assert!(matches!(
+            enumerate_kind_with(
+                SourceKind::Window,
+                || Err(PlatformError::Internal("sck failure".into())),
+                Vec::new,
+            ),
+            Err(PlatformError::Internal(message)) if message == "sck failure"
+        ));
+    }
+
     #[test]
     fn product_version_parses_plist_fixture() {
         let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -966,7 +1108,10 @@ mod tests {
 
     #[test]
     fn version_gate_maps_typed() {
-        let mapped = PlatformError::OsVersionTooOld { have: "macOS 12".into(), need: "macOS 99" };
+        let mapped = PlatformError::OsVersionTooOld {
+            have: "macOS 12".into(),
+            need: "macOS 99",
+        };
         match mapped {
             PlatformError::OsVersionTooOld { need, .. } => assert_eq!(need, "macOS 99"),
             other => panic!("unexpected {other:?}"),
@@ -996,10 +1141,14 @@ mod tests {
     #[test]
     fn gate_opens_exactly_on_cadence() {
         let interval = 1_000_000_000u64 / 15; // 15 fps profile
-        // Fresh streams accept the first frame immediately (init stamps
-        // one interval in the past).
+                                              // Fresh streams accept the first frame immediately (init stamps
+                                              // one interval in the past).
         assert!(gate_open(initial_last_ns(0, interval), 0, interval));
-        assert!(gate_open(initial_last_ns(5_000_000, interval), 5_000_000, interval));
+        assert!(gate_open(
+            initial_last_ns(5_000_000, interval),
+            5_000_000,
+            interval
+        ));
         assert!(!gate_open(0, interval - 1, interval));
         assert!(gate_open(0, interval, interval));
         assert!(gate_open(1_000, 1_000 + interval, interval));
@@ -1052,6 +1201,22 @@ mod tests {
         assert_eq!(interval(30), 33_333_333);
         assert_eq!(interval(15), 66_666_666);
         assert_eq!(interval(0), 1_000_000_000);
+    }
+
+    #[test]
+    fn materialize_rejects_null_buffer_without_touching_os() {
+        // SAFETY: test-only null handle; the helper null-checks before any
+        // CoreVideo call, so nothing is dereferenced.
+        let gpu = unsafe {
+            golive_platform::GpuPixelBuffer::from_raw(
+                std::ptr::null_mut(),
+                64,
+                64,
+                256,
+                release_cv_pixel_buffer,
+            )
+        };
+        assert!(materialize_gpu_buffer(&gpu).is_none());
     }
 
     #[test]

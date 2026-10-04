@@ -1,8 +1,8 @@
 // Preview ao vivo do modal: foco decide, mock nunca invoca, fio é GLP2.
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { renderToStaticMarkup } from "react-dom/server";
 import { createElement } from "react";
-import { PreviewPlayer, SelfViewPlayer, appFocusNow } from "./PreviewPlayer";
+import { PreviewPlayer, SelfViewPlayer, appFocusNow, settleFocusUnlisten } from "./PreviewPlayer";
 
 describe("appFocusNow (puro: janela E documento)", () => {
   it("só focado + visível roda o preview", () => {
@@ -10,6 +10,24 @@ describe("appFocusNow (puro: janela E documento)", () => {
     expect(appFocusNow(false, false)).toBe(false);
     expect(appFocusNow(true, true)).toBe(false);
     expect(appFocusNow(false, true)).toBe(false);
+  });
+});
+
+describe("settleFocusUnlisten (unmount antes do onFocusChanged resolver)", () => {
+  it("montado: guarda o off para o cleanup chamar depois", () => {
+    let off: (() => void) | undefined;
+    const stop = vi.fn();
+    settleFocusUnlisten(false, stop, (live) => { off = live; });
+    expect(stop).not.toHaveBeenCalled();
+    expect(off).toBe(stop);
+  });
+
+  it("desmontado: para na hora, nunca guarda off órfão (sem listener vazado)", () => {
+    let off: (() => void) | undefined;
+    const stop = vi.fn();
+    settleFocusUnlisten(true, stop, (live) => { off = live; });
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(off).toBeUndefined();
   });
 });
 

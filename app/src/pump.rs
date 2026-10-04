@@ -68,8 +68,12 @@ pub fn spawn_pump(state: Arc<AppState>, app: Option<AppHandle>) -> tokio::task::
 }
 
 fn origin_is_current(inner: &super::Inner, origin: Option<&PublisherOrigin>) -> bool {
-    origin.is_some_and(|origin| inner.publishers.values()
-        .any(|session| origin.ptr_eq(&Arc::downgrade(&session.publisher))))
+    origin.is_some_and(|origin| {
+        inner
+            .publishers
+            .values()
+            .any(|session| origin.ptr_eq(&Arc::downgrade(&session.publisher)))
+    })
 }
 
 /// Forwards one session's media events: owner attribution + redacted emit.
@@ -88,26 +92,46 @@ pub fn spawn_forward(
                 ForwardTarget::Watch => Some(state.operations.lock().await),
                 ForwardTarget::Share => None,
             };
-            if watch_alive.as_ref().is_some_and(|alive| !alive.load(std::sync::atomic::Ordering::Acquire)) {
+            if watch_alive
+                .as_ref()
+                .is_some_and(|alive| !alive.load(std::sync::atomic::Ordering::Acquire))
+            {
                 continue;
             }
             // A stopped/replaced publisher may still have queued one-shot events.
-            if matches!(target, ForwardTarget::Share) && !state.inner.lock().is_ok_and(|inner| {
-                origin_is_current(&inner, origin.as_ref())
-            }) {
+            if matches!(target, ForwardTarget::Share)
+                && !state
+                    .inner
+                    .lock()
+                    .is_ok_and(|inner| origin_is_current(&inner, origin.as_ref()))
+            {
                 continue;
             }
             let mut fail_member: Option<String> = None;
             match event {
                 MediaEvent::IceConnected => {
-                    let _first = apply_ice_connected(&state, target, origin.as_ref(), watch_member.as_deref());
-                    emit(&app, "media-event", &serde_json::json!({"kind": "ice-connected"}));
+                    let _first = apply_ice_connected(
+                        &state,
+                        target,
+                        origin.as_ref(),
+                        watch_member.as_deref(),
+                    );
+                    emit(
+                        &app,
+                        "media-event",
+                        &serde_json::json!({"kind": "ice-connected"}),
+                    );
                 }
                 MediaEvent::IceFailed => {
-                    emit(&app, "media-event", &serde_json::json!({"kind": "ice-failed"}));
+                    emit(
+                        &app,
+                        "media-event",
+                        &serde_json::json!({"kind": "ice-failed"}),
+                    );
                     state.session_log("ice failed".to_string());
                     reset_media_counters(&state);
-                    fail_member = failed_member(&state, target, origin.as_ref(), watch_member.as_deref());
+                    fail_member =
+                        failed_member(&state, target, origin.as_ref(), watch_member.as_deref());
                 }
                 MediaEvent::VideoFrame { non_black, motion } => {
                     bump_frame(&state, non_black);
@@ -119,10 +143,19 @@ pub fn spawn_forward(
                 }
                 MediaEvent::Keyframe => {
                     bump_keyframe(&state);
-                    emit(&app, "media-event", &serde_json::json!({"kind": "keyframe"}));
+                    emit(
+                        &app,
+                        "media-event",
+                        &serde_json::json!({"kind": "keyframe"}),
+                    );
                 }
                 MediaEvent::Stats(stats) => {
-                    merge_stats(&state, stats.frames_decoded, stats.keyframes_decoded, stats.ice_connected);
+                    merge_stats(
+                        &state,
+                        stats.frames_decoded,
+                        stats.keyframes_decoded,
+                        stats.ice_connected,
+                    );
                     // Generation fence (host side): the encode thread bumps
                     // it on every applied reconfig. First observer wins the
                     // authoritative `quality` event; the snapshot
@@ -134,7 +167,8 @@ pub fn spawn_forward(
                                 if !origin_is_current(&inner, origin.as_ref()) {
                                     continue;
                                 }
-                                let current = inner.share_profile.map(|s| s.generation).unwrap_or(0);
+                                let current =
+                                    inner.share_profile.map(|s| s.generation).unwrap_or(0);
                                 if stats.generation > current {
                                     if let Some(share) = inner.share_profile.as_mut() {
                                         share.generation = stats.generation;
@@ -171,7 +205,12 @@ pub fn spawn_forward(
                             .inner
                             .lock()
                             .map(|inner| {
-                                inner.video_windows.values().map(|w| w.presented()).sum::<u64>() + inner.players.values().map(|p| p.presented).sum::<u64>()
+                                inner
+                                    .video_windows
+                                    .values()
+                                    .map(|w| w.presented())
+                                    .sum::<u64>()
+                                    + inner.players.values().map(|p| p.presented).sum::<u64>()
                             })
                             .unwrap_or(0)
                     };
@@ -196,19 +235,15 @@ pub fn spawn_forward(
                     // First sighting (and every change) also lands in the
                     // session file for packaged verification.
                     let backend = match target {
-                        ForwardTarget::Share => state
-                            .inner
-                            .lock()
-                            .ok()
-                            .and_then(|inner| {
-                                inner
-                                    .publishers
-                                    .values()
-                                    .filter_map(|session| session.publisher.try_lock().ok())
-                                    .filter_map(|publisher| publisher.backend())
-                                    .map(|name| name.to_owned())
-                                    .next()
-                            }),
+                        ForwardTarget::Share => state.inner.lock().ok().and_then(|inner| {
+                            inner
+                                .publishers
+                                .values()
+                                .filter_map(|session| session.publisher.try_lock().ok())
+                                .filter_map(|publisher| publisher.backend())
+                                .map(|name| name.to_owned())
+                                .next()
+                        }),
                         ForwardTarget::Watch => None,
                     };
                     if matches!(target, ForwardTarget::Share) {
@@ -224,9 +259,8 @@ pub fn spawn_forward(
                             // and counts only (never addresses — the struct
                             // cannot even hold them).
                             if !inner.census_logged {
-                                let total = stats.census.host
-                                    + stats.census.srflx
-                                    + stats.census.other_typ;
+                                let total =
+                                    stats.census.host + stats.census.srflx + stats.census.other_typ;
                                 if total > 0 {
                                     inner.census_logged = true;
                                     state.session_log(format!(
@@ -271,28 +305,27 @@ pub fn spawn_forward(
                     // ICE in "negotiating" forever.
                     match target {
                         ForwardTarget::Watch => {
-                            forward_viewer_candidate(&state, candidate, watch_member.as_deref()).await;
+                            forward_viewer_candidate(&state, candidate, watch_member.as_deref())
+                                .await;
                         }
                         ForwardTarget::Share => {
                             forward_host_candidate(&state, candidate, origin.as_ref()).await;
                         }
                     }
                 }
-                MediaEvent::IceGatheringComplete => {
-                    match target {
-                        ForwardTarget::Watch => {
-                            forward_viewer_gathering_complete(&state, watch_member.as_deref()).await;
-                        }
-                        ForwardTarget::Share => {
-                            forward_host_gathering_complete(&state, origin.as_ref()).await;
-                            emit(
-                                &app,
-                                "media-event",
-                                &serde_json::json!({"kind": "gathering-complete"}),
-                            );
-                        }
+                MediaEvent::IceGatheringComplete => match target {
+                    ForwardTarget::Watch => {
+                        forward_viewer_gathering_complete(&state, watch_member.as_deref()).await;
                     }
-                }
+                    ForwardTarget::Share => {
+                        forward_host_gathering_complete(&state, origin.as_ref()).await;
+                        emit(
+                            &app,
+                            "media-event",
+                            &serde_json::json!({"kind": "gathering-complete"}),
+                        );
+                    }
+                },
                 MediaEvent::Error(_) => {
                     emit(&app, "media-event", &serde_json::json!({"kind": "error"}));
                 }
@@ -329,14 +362,23 @@ fn ice_fence(
     watch_member: Option<&str>,
 ) -> Option<Fence> {
     match target {
-        ForwardTarget::Watch => inner.viewers.get(watch_member?).map(|session| session.fence),
+        ForwardTarget::Watch => inner
+            .viewers
+            .get(watch_member?)
+            .map(|session| session.fence),
         ForwardTarget::Share => {
             let watcher = select_host_trickle_target(
-                inner.publishers.iter().map(|(k, s)| (k.as_str(), &s.wire, &s.publisher)),
+                inner
+                    .publishers
+                    .iter()
+                    .map(|(k, s)| (k.as_str(), &s.wire, &s.publisher)),
                 origin?,
             )?
             .0;
-            inner.publishers.get(&watcher).map(|session| session.owner_fence)
+            inner
+                .publishers
+                .get(&watcher)
+                .map(|session| session.owner_fence)
         }
     }
 }
@@ -390,7 +432,10 @@ fn failed_member(
         ForwardTarget::Watch => watch_member.map(str::to_owned),
         ForwardTarget::Share => {
             let watcher = select_host_trickle_target(
-                inner.publishers.iter().map(|(k, s)| (k.as_str(), &s.wire, &s.publisher)),
+                inner
+                    .publishers
+                    .iter()
+                    .map(|(k, s)| (k.as_str(), &s.wire, &s.publisher)),
                 origin?,
             )?
             .0;
@@ -423,7 +468,11 @@ pub(crate) fn arm_negotiate_timeout(
         if !stale {
             return;
         }
-        emit(&app, "media-event", &serde_json::json!({"kind": "ice-failed"}));
+        emit(
+            &app,
+            "media-event",
+            &serde_json::json!({"kind": "ice-failed"}),
+        );
         state.session_log("ice timeout".to_string());
         reset_media_counters(&state);
         let _ = state.unwatch(&member).await;
@@ -441,7 +490,10 @@ fn arm_media_watchdog(
 ) {
     tokio::spawn(async move {
         tokio::time::sleep(MEDIA_WATCHDOG).await;
-        if watch_alive.as_ref().is_some_and(|alive| !alive.load(std::sync::atomic::Ordering::Acquire)) {
+        if watch_alive
+            .as_ref()
+            .is_some_and(|alive| !alive.load(std::sync::atomic::Ordering::Acquire))
+        {
             return;
         }
         let frames = state
@@ -453,10 +505,16 @@ fn arm_media_watchdog(
         if !media_watchdog_trip(frames, MEDIA_WATCHDOG) {
             return;
         }
-        emit(&app, "media-event", &serde_json::json!({"kind": "ice-failed"}));
+        emit(
+            &app,
+            "media-event",
+            &serde_json::json!({"kind": "ice-failed"}),
+        );
         state.session_log("ice watchdog no frames".to_string());
         reset_media_counters(&state);
-        if let Some(member) = failed_member(&state, target, origin.as_ref(), watch_member.as_deref()) {
+        if let Some(member) =
+            failed_member(&state, target, origin.as_ref(), watch_member.as_deref())
+        {
             match target {
                 ForwardTarget::Watch => {
                     let _ = state.unwatch(&member).await;
@@ -579,8 +637,9 @@ fn select_host_trickle_target<'a, T: 'a>(
     origin: &Weak<T>,
 ) -> Option<(String, WireIds)> {
     entries
-        .filter(|(key, ids, publisher)| !key.is_empty() && !ids.session.is_empty()
-            && origin.ptr_eq(&Arc::downgrade(publisher)))
+        .filter(|(key, ids, publisher)| {
+            !key.is_empty() && !ids.session.is_empty() && origin.ptr_eq(&Arc::downgrade(publisher))
+        })
         .map(|(key, ids, _)| (key.to_owned(), ids.clone()))
         .next()
 }
@@ -588,15 +647,25 @@ fn select_host_trickle_target<'a, T: 'a>(
 /// Host trickle-out: adopted per-watcher link's wire ids + watcher as `to`.
 /// Mirrors `forward_viewer_candidate` (same envelope shape/validation; the
 /// viewer already understands Candidate + ice-complete per PROTOCOL.md).
-async fn forward_host_candidate(state: &Arc<AppState>, candidate: String, origin: Option<&PublisherOrigin>) {
+async fn forward_host_candidate(
+    state: &Arc<AppState>,
+    candidate: String,
+    origin: Option<&PublisherOrigin>,
+) {
     let (to, ids) = {
         let inner = match state.inner.lock() {
             Ok(inner) => inner,
             Err(_) => return,
         };
         match select_host_trickle_target(
-            inner.publishers.iter().map(|(k, s)| (k.as_str(), &s.wire, &s.publisher)),
-            match origin { Some(origin) => origin, None => return },
+            inner
+                .publishers
+                .iter()
+                .map(|(k, s)| (k.as_str(), &s.wire, &s.publisher)),
+            match origin {
+                Some(origin) => origin,
+                None => return,
+            },
         ) {
             Some(target) => target,
             None => return,
@@ -623,8 +692,14 @@ async fn forward_host_gathering_complete(state: &Arc<AppState>, origin: Option<&
             Err(_) => return,
         };
         match select_host_trickle_target(
-            inner.publishers.iter().map(|(k, s)| (k.as_str(), &s.wire, &s.publisher)),
-            match origin { Some(origin) => origin, None => return },
+            inner
+                .publishers
+                .iter()
+                .map(|(k, s)| (k.as_str(), &s.wire, &s.publisher)),
+            match origin {
+                Some(origin) => origin,
+                None => return,
+            },
         ) {
             Some(target) => target,
             None => return,
@@ -651,7 +726,12 @@ fn wire_ids(fence: &Fence) -> Option<WireIds> {
     })
 }
 
-fn envelope(ids: &WireIds, kind: EnvelopeKind, sdp: Option<String>, candidate: Option<String>) -> Envelope {
+fn envelope(
+    ids: &WireIds,
+    kind: EnvelopeKind,
+    sdp: Option<String>,
+    candidate: Option<String>,
+) -> Envelope {
     Envelope {
         kind,
         session: ids.session.clone(),
@@ -670,7 +750,11 @@ fn current(ids: &WireIds, payload: &Envelope) -> bool {
 async fn handle_signal(state: &Arc<AppState>, app: &Option<AppHandle>, message: Incoming) {
     match message {
         Incoming::Admitted { .. } => {
-            emit(app, "signal-event", &serde_json::json!({"kind": "admitted"}));
+            emit(
+                app,
+                "signal-event",
+                &serde_json::json!({"kind": "admitted"}),
+            );
         }
         Incoming::Pending => {
             emit(app, "signal-event", &serde_json::json!({"kind": "pending"}));
@@ -694,14 +778,22 @@ async fn handle_signal(state: &Arc<AppState>, app: &Option<AppHandle>, message: 
                     Ok(inner) => inner,
                     Err(_) => return,
                 };
-                let absent = |member: &&String| {
-                    !roster.entries.iter().any(|entry| entry.id == **member)
-                };
+                let absent =
+                    |member: &&String| !roster.entries.iter().any(|entry| entry.id == **member);
                 (
-                    inner.viewers.keys().filter(absent).cloned().collect::<Vec<_>>(),
-                    inner.publishers.keys()
+                    inner
+                        .viewers
+                        .keys()
+                        .filter(absent)
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                    inner
+                        .publishers
+                        .keys()
                         .filter(|member| !member.is_empty())
-                        .filter(absent).cloned().collect::<Vec<_>>(),
+                        .filter(absent)
+                        .cloned()
+                        .collect::<Vec<_>>(),
                 )
             };
             for member in departed_viewers {
@@ -724,11 +816,19 @@ async fn handle_signal(state: &Arc<AppState>, app: &Option<AppHandle>, message: 
             );
         }
         Incoming::Watch { from } => {
-            emit(app, "signal-event", &serde_json::json!({"kind": "watch", "from": from}));
+            emit(
+                app,
+                "signal-event",
+                &serde_json::json!({"kind": "watch", "from": from}),
+            );
             on_watch(state, app, &from).await;
         }
         Incoming::Unwatch { from } => {
-            emit(app, "signal-event", &serde_json::json!({"kind": "unwatch", "from": from}));
+            emit(
+                app,
+                "signal-event",
+                &serde_json::json!({"kind": "unwatch", "from": from}),
+            );
             on_unwatch(state, &from).await;
         }
         Incoming::Signal { from, payload, .. } => {
@@ -793,9 +893,10 @@ async fn on_watch(state: &Arc<AppState>, app: &Option<AppHandle>, watcher: &str)
                 false
             }
         };
-        if !adopted_template && !state
-            .adopt_fresh_session(app.clone(), watcher, fence, ids.clone())
-            .await
+        if !adopted_template
+            && !state
+                .adopt_fresh_session(app.clone(), watcher, fence, ids.clone())
+                .await
         {
             // Share not live (or the rebuild failed): refuse quietly, as
             // before — no offer, no fence advance.
@@ -886,13 +987,19 @@ fn window_fits(contracted: Option<(u32, u32)>, w: u32, h: u32) -> bool {
 /// with consecutive seqs and mirrored directions mean one flapping link;
 /// non-consecutive seqs mean interleaved links spawned in between.
 fn respawn_line(seq: u64, old: (u32, u32), new: (u32, u32)) -> String {
-    format!("present window respawn #{seq} {}x{} -> {}x{}", old.0, old.1, new.0, new.1)
+    format!(
+        "present window respawn #{seq} {}x{} -> {}x{}",
+        old.0, old.1, new.0, new.1
+    )
 }
 
 /// Window-death log line: truncated member id only (same redaction rule as
 /// the watch/unwatch milestones — never names, titles, or tokens).
 fn window_closed_line(member: &str) -> String {
-    format!("watch window closed member={}", crate::session_log::short_id(member))
+    format!(
+        "watch window closed member={}",
+        crate::session_log::short_id(member)
+    )
 }
 
 /// Pushes one decoded frame to a watched member's present window. When the
@@ -920,7 +1027,12 @@ fn push_present_frame(
     // Event-driven decode observation (feeds per-link stats; no polling
     // anywhere on this path).
     state.note_link_frame(watcher, title, frame.w as u32, frame.h as u32, alive);
-    if state.inner.lock().map(|inner| inner.desktop.is_some()).unwrap_or(true) {
+    if state
+        .inner
+        .lock()
+        .map(|inner| inner.desktop.is_some())
+        .unwrap_or(true)
+    {
         state.present_inline(watcher, frame, alive);
         return;
     }
@@ -995,9 +1107,10 @@ fn push_present_frame(
                 // (re-watch in between) must be left alone.
                 let dying = state.inner.lock().ok().map(|inner| {
                     inner.viewers.get(&watcher).is_some_and(|session| {
-                        session.alive.as_ref().is_some_and(|flag| {
-                            !flag.load(std::sync::atomic::Ordering::Acquire)
-                        })
+                        session
+                            .alive
+                            .as_ref()
+                            .is_some_and(|flag| !flag.load(std::sync::atomic::Ordering::Acquire))
                     })
                 });
                 if matches!(dying, Some(true)) {
@@ -1054,7 +1167,9 @@ async fn on_envelope(
                 Ok(inner) => inner,
                 Err(_) => return,
             };
-            inner.publishers.get(from)
+            inner
+                .publishers
+                .get(from)
                 .is_some_and(|session| current(&session.wire, payload))
         }
     };
@@ -1135,7 +1250,11 @@ async fn on_host_envelope(state: &Arc<AppState>, watcher: &str, payload: &Envelo
                             None => return,
                         }
                     };
-                    let _ = publisher.lock().await.add_remote_candidate(&candidate).await;
+                    let _ = publisher
+                        .lock()
+                        .await
+                        .add_remote_candidate(&candidate)
+                        .await;
                 } else {
                     // Queue until the answer lands (ufrag needs it).
                     if let Ok(mut inner) = state.inner.lock() {
@@ -1239,7 +1358,10 @@ async fn on_viewer_envelope(
                 Ok(inner) => inner,
                 Err(_) => return,
             };
-            inner.viewers.get(from).and_then(|session| session.adopted.clone())
+            inner
+                .viewers
+                .get(from)
+                .and_then(|session| session.adopted.clone())
         };
         let Some(ids) = adopted else { return };
         if !current(&ids, payload) {
@@ -1291,9 +1413,17 @@ async fn on_viewer_envelope(
         let on_audio = playback
             .as_ref()
             .map(crate::audio::ViewerPlayback::callback);
-        let compact = state.inner.lock().map(|inner| inner.desktop.is_some()).unwrap_or(false)
+        let compact = state
+            .inner
+            .lock()
+            .map(|inner| inner.desktop.is_some())
+            .unwrap_or(false)
             && std::env::var_os("GOLIVE_VIEWER_RGBA").is_none();
-        let viewer = match NativeViewer::start_with_audio_format(None, event_tx, on_frame, on_audio, compact).await {
+        let viewer = match NativeViewer::start_with_audio_format(
+            None, event_tx, on_frame, on_audio, compact,
+        )
+        .await
+        {
             Ok(viewer) => Arc::new(tokio::sync::Mutex::new(viewer)),
             Err(_) => return,
         };
@@ -1390,7 +1520,8 @@ mod present_respawn_tests {
         golive_core::media::PresentedFrame {
             w,
             h,
-            format: golive_core::media::PixelFormat::Rgba, data: vec![128u8; w * h * 4],
+            format: golive_core::media::PixelFormat::Rgba,
+            data: vec![128u8; w * h * 4],
         }
     }
 
@@ -1399,7 +1530,14 @@ mod present_respawn_tests {
         let state = Arc::new(AppState::new());
         let presented = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let alive = std::sync::atomic::AtomicBool::new(false);
-        push_present_frame(&state, "watcher", "watcher", &presented, frame(2, 2), &alive);
+        push_present_frame(
+            &state,
+            "watcher",
+            "watcher",
+            &presented,
+            frame(2, 2),
+            &alive,
+        );
         let inner = state.inner.lock().unwrap();
         assert!(inner.video_windows.is_empty());
         assert!(inner.video_feeds.is_empty());
@@ -1453,46 +1591,112 @@ mod present_respawn_tests {
             inner.video_feeds.insert("watcher".to_owned(), push);
         }
         // Same-dims frame: exact old path, same window, feed untouched.
-        push_present_frame(&state, "watcher", "watcher", &presented, frame(64, 36), &std::sync::atomic::AtomicBool::new(true));
+        push_present_frame(
+            &state,
+            "watcher",
+            "watcher",
+            &presented,
+            frame(64, 36),
+            &std::sync::atomic::AtomicBool::new(true),
+        );
         {
             let inner = state.inner.lock().expect("state lock");
-            assert_eq!(inner.video_windows.get("watcher").expect("window").resolution(), (64, 36));
-            assert_eq!(inner.video_windows.get("watcher").expect("window").pushed(), 1);
+            assert_eq!(
+                inner
+                    .video_windows
+                    .get("watcher")
+                    .expect("window")
+                    .resolution(),
+                (64, 36)
+            );
+            assert_eq!(
+                inner.video_windows.get("watcher").expect("window").pushed(),
+                1
+            );
         }
         // New-dims frame (post quality-apply): the stale 64x36 window is
         // replaced, and the frame lands in the fresh feed. The replacement
         // reserves the next per-link sequence for the respawn line.
-        push_present_frame(&state, "watcher", "watcher", &presented, frame(32, 18), &std::sync::atomic::AtomicBool::new(true));
+        push_present_frame(
+            &state,
+            "watcher",
+            "watcher",
+            &presented,
+            frame(32, 18),
+            &std::sync::atomic::AtomicBool::new(true),
+        );
         {
             let inner = state.inner.lock().expect("state lock");
-            let window = inner.video_windows.get("watcher").expect("respawned window");
-            assert_eq!(window.resolution(), (32, 18), "contract follows the new dims");
+            let window = inner
+                .video_windows
+                .get("watcher")
+                .expect("respawned window");
+            assert_eq!(
+                window.resolution(),
+                (32, 18),
+                "contract follows the new dims"
+            );
             assert_eq!(window.pushed(), 1, "new frame accepted by the fresh feed");
-            assert_eq!(inner.video_seq.get("watcher"), Some(&1), "respawn carries seq #1");
-            assert_eq!(inner.next_video_seq, 2, "counter advances past the reservation");
+            assert_eq!(
+                inner.video_seq.get("watcher"),
+                Some(&1),
+                "respawn carries seq #1"
+            );
+            assert_eq!(
+                inner.next_video_seq, 2,
+                "counter advances past the reservation"
+            );
         }
         // Steady state again: same-dims frames reuse without respawn.
-        push_present_frame(&state, "watcher", "watcher", &presented, frame(32, 18), &std::sync::atomic::AtomicBool::new(true));
+        push_present_frame(
+            &state,
+            "watcher",
+            "watcher",
+            &presented,
+            frame(32, 18),
+            &std::sync::atomic::AtomicBool::new(true),
+        );
         {
             let inner = state.inner.lock().expect("state lock");
             let window = inner.video_windows.get("watcher").expect("window");
             assert_eq!(window.resolution(), (32, 18));
             assert_eq!(window.pushed(), 2, "reuse feeds the live window");
-            assert_eq!(inner.video_seq.get("watcher"), Some(&1), "reuse reserves nothing");
+            assert_eq!(
+                inner.video_seq.get("watcher"),
+                Some(&1),
+                "reuse reserves nothing"
+            );
         }
         // A second link gets its own sequence: interleaved links stay
         // distinguishable from one flapping link in the session log.
-        push_present_frame(&state, "other", "other", &presented, frame(64, 36), &std::sync::atomic::AtomicBool::new(true));
+        push_present_frame(
+            &state,
+            "other",
+            "other",
+            &presented,
+            frame(64, 36),
+            &std::sync::atomic::AtomicBool::new(true),
+        );
         {
             let inner = state.inner.lock().expect("state lock");
-            assert_eq!(inner.video_seq.get("other"), Some(&2), "second link gets seq #2");
+            assert_eq!(
+                inner.video_seq.get("other"),
+                Some(&2),
+                "second link gets seq #2"
+            );
         }
         state.close_video_window("watcher");
         state.close_video_window("other");
         {
             let inner = state.inner.lock().expect("state lock");
-            assert!(!inner.video_seq.contains_key("watcher"), "close forgets the seq");
-            assert!(!inner.video_seq.contains_key("other"), "close forgets the seq");
+            assert!(
+                !inner.video_seq.contains_key("watcher"),
+                "close forgets the seq"
+            );
+            assert!(
+                !inner.video_seq.contains_key("other"),
+                "close forgets the seq"
+            );
         }
     }
 
@@ -1518,16 +1722,36 @@ mod present_respawn_tests {
             inner.video_windows.insert("watcher".to_owned(), window);
             inner.video_feeds.insert("watcher".to_owned(), push);
         }
-        push_present_frame(&state, "watcher", "watcher", &presented, frame(64, 36), &alive);
-        assert!(!alive.load(std::sync::atomic::Ordering::Acquire), "liveness flips");
+        push_present_frame(
+            &state,
+            "watcher",
+            "watcher",
+            &presented,
+            frame(64, 36),
+            &alive,
+        );
+        assert!(
+            !alive.load(std::sync::atomic::Ordering::Acquire),
+            "liveness flips"
+        );
         {
             let inner = state.inner.lock().expect("state lock");
-            assert!(!inner.video_windows.contains_key("watcher"), "window forgotten");
+            assert!(
+                !inner.video_windows.contains_key("watcher"),
+                "window forgotten"
+            );
             assert!(!inner.video_feeds.contains_key("watcher"), "feed forgotten");
             assert!(!inner.video_seq.contains_key("watcher"), "seq forgotten");
         }
         // A racing in-flight frame must not pop the window back open.
-        push_present_frame(&state, "watcher", "watcher", &presented, frame(64, 36), &alive);
+        push_present_frame(
+            &state,
+            "watcher",
+            "watcher",
+            &presented,
+            frame(64, 36),
+            &alive,
+        );
         {
             let inner = state.inner.lock().expect("state lock");
             assert!(!inner.video_windows.contains_key("watcher"), "stays closed");
@@ -1553,11 +1777,24 @@ mod present_respawn_tests {
             inner.video_windows.insert("watcher".to_owned(), window);
             inner.video_feeds.insert("watcher".to_owned(), push);
         }
-        push_present_frame(&state, "watcher", "watcher", &presented, frame(64, 36), &alive);
-        assert!(alive.load(std::sync::atomic::Ordering::Acquire), "watch survives");
+        push_present_frame(
+            &state,
+            "watcher",
+            "watcher",
+            &presented,
+            frame(64, 36),
+            &alive,
+        );
+        assert!(
+            alive.load(std::sync::atomic::Ordering::Acquire),
+            "watch survives"
+        );
         {
             let inner = state.inner.lock().expect("state lock");
-            let window = inner.video_windows.get("watcher").expect("respawned window");
+            let window = inner
+                .video_windows
+                .get("watcher")
+                .expect("respawned window");
             assert_eq!(window.resolution(), (64, 36));
             assert_eq!(window.pushed(), 1, "frame accepted by the fresh feed");
         }
@@ -1594,12 +1831,8 @@ mod present_respawn_tests {
                     pending_remote: Vec::new(),
                 },
             );
-            let (window, push) = crate::video::VideoWindow::spawn(
-                "peer".to_owned(),
-                64,
-                36,
-                Arc::clone(&presented),
-            );
+            let (window, push) =
+                crate::video::VideoWindow::spawn("peer".to_owned(), 64, 36, Arc::clone(&presented));
             window.mark_unhealthy();
             window.mark_peer_gone();
             inner.video_windows.insert("peer".to_owned(), window);
@@ -1616,8 +1849,14 @@ mod present_respawn_tests {
         }
         {
             let inner = state.inner.lock().expect("state lock");
-            assert!(!inner.viewers.contains_key("peer"), "watch session torn down");
-            assert!(!inner.video_windows.contains_key("peer"), "window forgotten");
+            assert!(
+                !inner.viewers.contains_key("peer"),
+                "watch session torn down"
+            );
+            assert!(
+                !inner.video_windows.contains_key("peer"),
+                "window forgotten"
+            );
         }
     }
 }
@@ -1642,7 +1881,8 @@ mod host_trickle_tests {
         let publisher = Arc::new(());
         let entries = [("", &template, &publisher)];
         assert!(
-            select_host_trickle_target(entries.iter().copied(), &Arc::downgrade(&publisher)).is_none()
+            select_host_trickle_target(entries.iter().copied(), &Arc::downgrade(&publisher))
+                .is_none()
         );
     }
 
@@ -1651,9 +1891,13 @@ mod host_trickle_tests {
         let template = WireIds::default();
         let live = wire("7");
         let publisher = Arc::new(());
-        let entries = [("", &template, &publisher), ("watcher-abc", &live, &publisher)];
-        let (to, ids) = select_host_trickle_target(entries.iter().copied(), &Arc::downgrade(&publisher))
-            .expect("adopted link selected");
+        let entries = [
+            ("", &template, &publisher),
+            ("watcher-abc", &live, &publisher),
+        ];
+        let (to, ids) =
+            select_host_trickle_target(entries.iter().copied(), &Arc::downgrade(&publisher))
+                .expect("adopted link selected");
         assert_eq!(to, "watcher-abc");
         assert_eq!(ids.session, "7");
     }
@@ -1663,7 +1907,8 @@ mod host_trickle_tests {
         let publisher = Arc::new(());
         let entries: [(&str, &WireIds, &Arc<()>); 0] = [];
         assert!(
-            select_host_trickle_target(entries.iter().copied(), &Arc::downgrade(&publisher)).is_none()
+            select_host_trickle_target(entries.iter().copied(), &Arc::downgrade(&publisher))
+                .is_none()
         );
     }
 
@@ -1733,6 +1978,7 @@ mod rewatch_tests {
     use crate::{EffectiveQuality, ShareSource};
     use golive_core::media::Quality;
     use golive_core::state::{LinkState, ShareState};
+    use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     /// Opens session + live share on the owner only (no room/signal), so
@@ -1751,10 +1997,15 @@ mod rewatch_tests {
     /// no honest-skip (synthetic never touches a window server).
     async fn seed_synthetic_template(state: &Arc<AppState>) {
         let live = Arc::new(std::sync::Mutex::new(Quality::P720.profile()));
-        let (publisher, bridge, event_rx) =
-            AppState::build_source_session(&ShareSource::Synthetic, Quality::P720.profile(), &live, None)
-                .await
-                .expect("template builds");
+        let (publisher, bridge, event_rx) = AppState::build_source_session(
+            &ShareSource::Synthetic,
+            Quality::P720.profile(),
+            &live,
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await
+        .expect("template builds");
         assert!(bridge.is_none(), "synthetic owns no bridge");
         let publisher = Arc::new(tokio::sync::Mutex::new(publisher));
         {
@@ -1792,10 +2043,16 @@ mod rewatch_tests {
     fn assert_wire_live(state: &AppState, watcher: &str) {
         let inner = state.inner.lock().expect("state lock");
         let session = inner.publishers.get(watcher).expect("session live");
-        assert!(!session.wire.session.is_empty(), "adopted wire carries session");
+        assert!(
+            !session.wire.session.is_empty(),
+            "adopted wire carries session"
+        );
         assert!(!session.wire.share.is_empty(), "adopted wire carries share");
         assert!(!session.wire.link.is_empty(), "adopted wire carries link");
-        assert!(!session.wire.attempt.is_empty(), "adopted wire carries attempt");
+        assert!(
+            !session.wire.attempt.is_empty(),
+            "adopted wire carries attempt"
+        );
     }
 
     /// Reports the stored owner fence as transport-connected (stands in for
@@ -1854,27 +2111,54 @@ mod rewatch_tests {
         let receive_fence = {
             let mut inner = state.inner.lock().unwrap();
             let fence = inner.owner.watch_remote("peer").unwrap();
-            inner.viewers.insert("peer".into(), crate::WatchSession {
-                playback: None,
-                fence,
-                viewer: None,
-                adopted: None,
-                alive: None,
-                remote_ready: false,
-                pending_remote: Vec::new(),
-            });
+            inner.viewers.insert(
+                "peer".into(),
+                crate::WatchSession {
+                    playback: None,
+                    fence,
+                    viewer: None,
+                    adopted: None,
+                    alive: None,
+                    remote_ready: false,
+                    pending_remote: Vec::new(),
+                },
+            );
             fence
         };
         on_watch(&state, &None, "peer").await;
-        let connected = state.inner.lock().unwrap().owner.link_connected(&receive_fence);
+        let connected = state
+            .inner
+            .lock()
+            .unwrap()
+            .owner
+            .link_connected(&receive_fence);
         on_unwatch(&state, "peer").await;
-        let after_unwatch = state.inner.lock().unwrap().owner.link_is_current(&receive_fence);
+        let after_unwatch = state
+            .inner
+            .lock()
+            .unwrap()
+            .owner
+            .link_is_current(&receive_fence);
         state.stop_share().await.unwrap();
-        let after_stop = state.inner.lock().unwrap().owner.link_is_current(&receive_fence);
+        let after_stop = state
+            .inner
+            .lock()
+            .unwrap()
+            .owner
+            .link_is_current(&receive_fence);
         state.leave().await.unwrap();
-        assert!(connected.is_ok(), "incoming watch must not invalidate our receiving fence");
-        assert!(after_unwatch, "remote unwatch must preserve our receiving link");
-        assert!(after_stop, "stopping our share must preserve our receiving link");
+        assert!(
+            connected.is_ok(),
+            "incoming watch must not invalidate our receiving fence"
+        );
+        assert!(
+            after_unwatch,
+            "remote unwatch must preserve our receiving link"
+        );
+        assert!(
+            after_stop,
+            "stopping our share must preserve our receiving link"
+        );
     }
 
     #[test]
@@ -1886,8 +2170,7 @@ mod rewatch_tests {
         {
             let mut inner = state.inner.lock().expect("state lock");
             inner.share_source = Some(ShareSource::Display("d1".into()));
-            inner.share_capture =
-                Some(Arc::new(std::sync::Mutex::new(Quality::P720.profile())));
+            inner.share_capture = Some(Arc::new(std::sync::Mutex::new(Quality::P720.profile())));
             inner.share_profile = Some(EffectiveQuality {
                 profile: Quality::P720.profile(),
                 generation: 0,
@@ -1912,7 +2195,10 @@ mod rewatch_tests {
                 matches!(inner.share_source, Some(ShareSource::Display(_))),
                 "source kept after {watcher}"
             );
-            assert!(inner.share_capture.is_some(), "live profile kept after {watcher}");
+            assert!(
+                inner.share_capture.is_some(),
+                "live profile kept after {watcher}"
+            );
             assert_eq!(
                 inner.owner.snapshot().share.state,
                 ShareState::Live,
@@ -1946,8 +2232,14 @@ mod rewatch_tests {
         on_watch(&state, &None, "w2").await;
         {
             let inner = state.inner.lock().expect("state lock");
-            assert!(inner.publishers.contains_key("w1"), "first link undisturbed");
-            assert!(inner.publishers.contains_key("w2"), "second peer builds fresh");
+            assert!(
+                inner.publishers.contains_key("w1"),
+                "first link undisturbed"
+            );
+            assert!(
+                inner.publishers.contains_key("w2"),
+                "second peer builds fresh"
+            );
         }
 
         // unwatch → template gone for good, share still live, source kept.
@@ -1988,7 +2280,12 @@ mod rewatch_tests {
                 .publisher
                 .clone()
         };
-        let sdp = publisher.lock().await.create_offer().await.expect("fresh offers");
+        let sdp = publisher
+            .lock()
+            .await
+            .create_offer()
+            .await
+            .expect("fresh offers");
         assert!(!sdp.is_empty(), "new offer produced on the rebuilt link");
         mark_connected(&state, "w1");
         let frames2 = wait_for_keyframes(&state, frames1, 20).await;
@@ -2001,7 +2298,10 @@ mod rewatch_tests {
             let inner = state.inner.lock().expect("state lock");
             assert!(inner.publishers.is_empty());
             assert_eq!(inner.owner.snapshot().share.state, ShareState::Stopped);
-            assert!(inner.share_source.is_none(), "stop clears the stored source");
+            assert!(
+                inner.share_source.is_none(),
+                "stop clears the stored source"
+            );
         }
         state.leave().await.expect("leave");
     }
@@ -2018,7 +2318,17 @@ mod retired_events_tests {
         tx.send(MediaEvent::IceConnected).unwrap();
         drop(tx);
         let alive = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        spawn_forward(Arc::clone(&state), None, rx, ForwardTarget::Watch, None, Some(alive), None).await.unwrap();
+        spawn_forward(
+            Arc::clone(&state),
+            None,
+            rx,
+            ForwardTarget::Watch,
+            None,
+            Some(alive),
+            None,
+        )
+        .await
+        .unwrap();
         assert!(!state.inner.lock().unwrap().media_counters.connected);
     }
 
@@ -2026,16 +2336,38 @@ mod retired_events_tests {
     async fn retired_publisher_stats_cannot_consume_new_share_generation() {
         let state = Arc::new(AppState::new());
         let expected = super::super::EffectiveQuality {
-            profile: golive_core::media::Quality::P720.profile(), generation: 0,
+            profile: golive_core::media::Quality::P720.profile(),
+            generation: 0,
         };
         state.inner.lock().unwrap().share_profile = Some(expected);
         let (tx, rx) = mpsc::unbounded_channel();
         tx.send(MediaEvent::Stats(golive_core::media::MediaStats {
-            generation: 99, ..Default::default()
-        })).unwrap();
+            generation: 99,
+            ..Default::default()
+        }))
+        .unwrap();
         drop(tx);
-        spawn_forward(Arc::clone(&state), None, rx, ForwardTarget::Share, Some(Weak::new()), None, None).await.unwrap();
-        assert_eq!(state.inner.lock().unwrap().share_profile.unwrap().generation, 0);
+        spawn_forward(
+            Arc::clone(&state),
+            None,
+            rx,
+            ForwardTarget::Share,
+            Some(Weak::new()),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            state
+                .inner
+                .lock()
+                .unwrap()
+                .share_profile
+                .unwrap()
+                .generation,
+            0
+        );
     }
 
     #[tokio::test]
@@ -2049,9 +2381,17 @@ mod retired_events_tests {
         }))
         .unwrap();
         drop(tx);
-        spawn_forward(Arc::clone(&state), None, rx, ForwardTarget::Watch, None, None, None)
-            .await
-            .unwrap();
+        spawn_forward(
+            Arc::clone(&state),
+            None,
+            rx,
+            ForwardTarget::Watch,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(!state.inner.lock().unwrap().media_counters.connected);
     }
 

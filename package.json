@@ -1,6 +1,6 @@
 {
   "name": "golive",
-  "version": "0.7.19",
+  "version": "0.7.20",
   "private": true,
   "scripts": {
     "build:windows": "npm --prefix app/web run build && cd app && cargo tauri build -- --bin goDrinking",

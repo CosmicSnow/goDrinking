@@ -36,6 +36,20 @@ export function appFocusNow(
 }
 
 /**
+ * Assenta o unlisten do `onFocusChanged`: se o efeito já desmontou
+ * (`cancelled`), para na hora em vez de guardar um `off` que ninguém
+ * chamaria — sem isso o listener vaza após o unmount. Puro e testável.
+ */
+export function settleFocusUnlisten(
+  cancelled: boolean,
+  stop: () => void,
+  onLive: (stop: () => void) => void,
+): void {
+  if (cancelled) stop();
+  else onLive(stop);
+}
+
+/**
  * Foco da janela do app. Fora do Tauri (mock/testes/SSR) assume focado e
  * delega a visibilidade ao documento — nunca quebra o caminho real.
  */
@@ -58,9 +72,7 @@ export function useAppFocus(): boolean {
         current.onFocusChanged(({ payload }) => {
           if (!cancelled) setFocused(payload);
         }).then(
-          (stop) => {
-            off = stop;
-          },
+          (stop) => settleFocusUnlisten(cancelled, stop, (live) => { off = live; }),
           () => undefined,
         );
       })

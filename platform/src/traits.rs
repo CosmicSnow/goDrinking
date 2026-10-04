@@ -39,7 +39,13 @@ impl FrameStream {
         stop_flag: Arc<AtomicBool>,
         worker: JoinHandle<()>,
     ) -> Self {
-        Self { rx, error, stop_flag, worker: Some(worker), capture_probe: None }
+        Self {
+            rx,
+            error,
+            stop_flag,
+            worker: Some(worker),
+            capture_probe: None,
+        }
     }
 
     pub fn with_capture_probe(mut self, probe: Arc<crate::capture_probe::CaptureProbe>) -> Self {
@@ -128,16 +134,70 @@ pub trait VideoSource: Send + Sized {
     /// empty-on-desktop to [`PlatformError::PermissionDenied`].
     fn enumerate() -> Result<Vec<SourceInfo>, PlatformError>;
 
+    /// List one source family without touching unrelated platform APIs.
+    /// Backends with independent permission domains should override this;
+    /// the default preserves the historical all-sources behavior.
+    fn enumerate_kind(kind: crate::types::SourceKind) -> Result<Vec<SourceInfo>, PlatformError> {
+        Ok(Self::enumerate()?
+            .into_iter()
+            .filter(|source| source.kind == kind)
+            .collect())
+    }
+
     /// Validate a listed id/kind pair without starting capture.
     fn open(info: &SourceInfo) -> Result<Self, PlatformError>;
 
     /// Start capture. May trigger the OS permission prompt on first use.
     fn start(&mut self, config: &CaptureConfig) -> Result<FrameStream, PlatformError>;
 
+    /// Start capture while observing a caller-owned cancellation signal.
+    /// Existing backends keep their current bounded start path; adapters
+    /// with asynchronous permission/setup can override this to cancel while
+    /// rendezvousing without weakening their ownership guarantees.
+    fn start_with_cancel(
+        &mut self,
+        config: &CaptureConfig,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<FrameStream, PlatformError> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(PlatformError::Internal("captura cancelada".into()));
+        }
+        self.start(config)
+    }
+
     /// Restart ordering for a profile switch on one listed source. Default
     /// is the glitch-free [`RestartOrder::NewFirst`]; backends whose OS
     /// forbids concurrent streams on one source override per kind.
     fn restart_order(_info: &SourceInfo) -> RestartOrder {
         RestartOrder::NewFirst
+    }
+}
+
+#[cfg(test)]
+mod scoped_contract_tests {
+    use super::*;
+    use crate::mock::MockSource;
+    use crate::types::SourceKind;
+
+    #[test]
+    fn default_scoped_enumeration_filters_the_common_list() {
+        let sources = MockSource::enumerate_kind(SourceKind::Display).unwrap();
+        assert!(!sources.is_empty());
+        assert!(sources
+            .iter()
+            .all(|source| source.kind == SourceKind::Display));
+        assert!(MockSource::enumerate_kind(SourceKind::Camera)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn default_start_honors_cancellation_before_opening() {
+        let source = MockSource::enumerate().unwrap().remove(0);
+        let mut source = MockSource::open(&source).unwrap();
+        let cancel = Arc::new(AtomicBool::new(true));
+        assert!(source
+            .start_with_cancel(&CaptureConfig::default(), cancel)
+            .is_err());
     }
 }

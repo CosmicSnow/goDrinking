@@ -1,5 +1,11 @@
 # changelog
 
+## v0.7.20
+
+- fix: webcam macOS em pipeline AVFoundation nativo (remove nokhwa do backend macOS) — delegate com entrega por callback, BGRA com stride padding, autorização por start sem prompt na enumeração
+- fix: preview de câmera com registro pendente antes da readiness, promoção atômica e teardown fora do lock; falhas de runtime/interrupção observadas com erro tipado
+- fix: bundle macOS com NSCameraUsageDescription + entitlement de câmera; PreviewPlayer sem leak de listener
+
 ## v0.7.19
 
 - fix: streamar + webcam ao mesmo tempo — Compartilhar espera o preview liberar a câmera (botão desabilita em voo) em vez de falhar ocupado; `selfview_start` distingue share sintético de parado

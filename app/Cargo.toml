@@ -1,6 +1,6 @@
 [package]
 name = "golive-app"
-version = "0.7.19"
+version = "0.7.20"
 edition = "2021"
 default-run = "goDrinking"
 license = "PolyForm-Noncommercial-1.0.0"
