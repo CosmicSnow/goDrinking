@@ -3,7 +3,7 @@ name = "golive-platform-windows"
 version = "0.7.5"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
-description = "goDrinking Windows capture backend (DXGI displays + WGC windows) behind the golive-platform contract."
+description = "goDrinking Windows capture backend (DXGI displays + WGC windows + webcam) behind the golive-platform contract."
 
 [lib]
 name = "golive_platform_windows"
@@ -31,3 +31,7 @@ windows = { version = "0.62", features = [
 ] }
 wasapi = "0.24.0"
 opus = "0.3"
+# Webcam capture (MediaFoundation via nokhwa's native input). `decoding`
+# brings MJPEG→RGB, `camera-sync-impl` makes `Camera: Send` for the pump
+# thread. No other OS input backend is used from this crate.
+nokhwa = { version = "0.10", default-features = false, features = ["decoding", "input-native", "camera-sync-impl"] }

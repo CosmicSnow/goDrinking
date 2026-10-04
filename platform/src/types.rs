@@ -11,6 +11,7 @@ use std::ptr::null_mut;
 pub enum SourceKind {
     Display,
     Window,
+    Camera,
 }
 
 /// One capturable source, as listed for the UI. `id` is the OS handle

@@ -383,3 +383,122 @@ async fn three_sender_player_fixture() {
     while Instant::now() < deadline && !dir.join("stop").exists() { tokio::time::sleep(Duration::from_millis(200)).await; }
     for sender in senders { sender.leave().await.unwrap(); }
 }
+
+/// Modal preview × share contention on one physical webcam, then the stage
+/// self-view on the live share. Locks the UI order the modal enforces
+/// (stop preview → share → mirror), against a real room + real device.
+///
+/// - preview_start holds the camera (first GLP2 packet proves it);
+/// - start_share on the held device either joins it (sharing drivers) or
+///   fails typed (single-open drivers) — never wedges, never panics;
+/// - after preview_stop the same share goes Live;
+/// - selfview_start then mirrors I420 GLP2 frames (format field == 1).
+/// Skips honestly with no webcam (CI/headless); virtual devices with no
+/// fulfillable mode are skipped per camera, never failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn camera_preview_share_selfview_flow() {
+    use golive_platform::SourceKind;
+    use tauri::ipc::{Channel, InvokeResponseBody};
+    let server = ServerGuard::spawn().expect("server");
+    let state = Arc::new(AppState::new());
+    // A device may open yet never deliver frames (virtual cameras) — only
+    // received bytes prove a usable webcam. Tried in list order, skipped
+    // honestly; the validated preview is stopped before sharing (UI order).
+    let mut camera_id: Option<String> = None;
+    for cam in state
+        .list_sources()
+        .await
+        .expect("list_sources")
+        .into_iter()
+        .filter(|s| s.kind == SourceKind::Camera)
+    {
+        let (pv_tx, pv_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
+        let preview = Channel::new(move |body| {
+            if let InvokeResponseBody::Raw(bytes) = body {
+                let _ = pv_tx.try_send(bytes);
+            }
+            Ok(())
+        });
+        match state.preview_start("camera", &cam.id, preview) {
+            Ok(token) => match pv_rx.recv_timeout(Duration::from_secs(12)) {
+                Ok(first) => {
+                    assert!(first.len() > 20 && &first[..4] == b"GLP2");
+                    state.preview_stop(&token);
+                    camera_id = Some(cam.id.clone());
+                    break;
+                }
+                Err(e) => {
+                    eprintln!("preview camera without frames: {e}");
+                    state.preview_stop(&token);
+                }
+            },
+            Err(e) => eprintln!("preview skipping camera: {e}"),
+        }
+    }
+    let Some(camera_id) = camera_id else {
+        eprintln!("no previewable webcam on this machine; skipping");
+        return;
+    };
+    // Reopen the preview to prove the share-ordering rule below from a
+    // held device, like the modal does.
+    let (pv_tx, pv_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
+    let preview = Channel::new(move |body| {
+        if let InvokeResponseBody::Raw(bytes) = body {
+            let _ = pv_tx.try_send(bytes);
+        }
+        Ok(())
+    });
+    let token = state
+        .preview_start("camera", &camera_id, preview)
+        .expect("preview opens the validated camera");
+    let first = pv_rx.recv_timeout(Duration::from_secs(20)).expect("preview frame");
+    assert!(first.len() > 20 && &first[..4] == b"GLP2");
+    drop(pv_rx);
+
+    state.set_server(&server.base).expect("set_server");
+    state
+        .create_room(None, "cam", "preview-contention-1")
+        .await
+        .expect("create_room");
+    let share_desc = format!("camera:{camera_id}");
+    match state.start_share(None, &share_desc, None).await {
+        Ok(()) => state.preview_stop(&token),
+        Err(e) => {
+            assert!(!e.is_empty(), "contention must fail typed, never empty");
+            eprintln!("single-open driver refused the held camera: {e}");
+            state.preview_stop(&token);
+            state
+                .start_share(None, &share_desc, None)
+                .await
+                .expect("share after preview stop");
+        }
+    }
+    let snap = state.get_snapshot().expect("snapshot");
+    assert_eq!(format!("{:?}", snap.share.state), "Live");
+
+    // Self-view mirrors the live share feed (no second device open).
+    let (sv_tx, sv_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(8);
+    let selfview = Channel::new(move |body| {
+        if let InvokeResponseBody::Raw(bytes) = body {
+            let _ = sv_tx.try_send(bytes);
+        }
+        Ok(())
+    });
+    let sv_token = state.selfview_start(selfview).expect("selfview on live share");
+    let mut got = 0u32;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while got < 3 && Instant::now() < deadline {
+        match sv_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(bytes) => {
+                assert!(bytes.len() > 20 && &bytes[..4] == b"GLP2");
+                assert_eq!(&bytes[16..20], &1u32.to_le_bytes(), "self-view is I420");
+                got += 1;
+            }
+            Err(_) => break,
+        }
+    }
+    state.selfview_stop(&sv_token);
+    state.stop_share().await.expect("stop_share");
+    state.leave().await.expect("leave");
+    assert_eq!(got, 3, "self-view must mirror live share frames");
+}

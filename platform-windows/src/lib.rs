@@ -24,6 +24,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 mod audio;
+mod camera;
 mod copy;
 mod d3d;
 mod dxgi;
@@ -58,14 +59,27 @@ impl WindowsSource {
             return Err(PlatformError::InvalidSource { reason: "id vazio" });
         }
         match info.kind {
-            SourceKind::Display | SourceKind::Window => Ok(Self { info: info.clone() }),
+            SourceKind::Display | SourceKind::Window | SourceKind::Camera => {
+                Ok(Self { info: info.clone() })
+            }
         }
     }
 }
 
 /// List capture targets on this PC. Empty on a real desktop means denial
 /// hid the content, so empty maps to `PermissionDenied`, never a silent UI.
+///
+/// Webcams are queried on a fresh thread: MediaFoundation refuses to start
+/// on a thread that already runs our MTA COM (`RPC_E_CHANGED_MODE`), and
+/// COM apartments are per-thread — so the MF query must never share this
+/// thread (nor the capture workers, see `start`).
 pub fn enumerate() -> Result<Vec<SourceInfo>, PlatformError> {
+    let cameras = std::thread::Builder::new()
+        .name("golive-cam-enum".into())
+        .spawn(camera::enumerate_cameras)
+        .map_err(|e| PlatformError::Internal(format!("thread de enumeração: {e}")))?
+        .join()
+        .map_err(|_| PlatformError::Internal("enumeração da webcam falhou".into()))?;
     init_com();
     let mut out = dxgi::enumerate_displays()?;
     match wgc::enumerate_windows() {
@@ -76,6 +90,9 @@ pub fn enumerate() -> Result<Vec<SourceInfo>, PlatformError> {
             }
         }
     }
+    // Webcams degrade to absent on query failure (the screen list still
+    // owns the denied-vs-empty verdict); denial surfaces at open/start.
+    out.extend(cameras);
     dxgi::empty_is_denied(&out)
 }
 
@@ -84,14 +101,27 @@ pub fn enumerate() -> Result<Vec<SourceInfo>, PlatformError> {
 /// current frame even on a static desktop) with a DXGI fallback; full
 /// display capture stays on the DXGI pump.
 pub fn thumbnail(kind: SourceKind, id: &str) -> Result<BgraFrame, PlatformError> {
-    init_com();
     let id = id.trim();
     if id.is_empty() {
         return Err(PlatformError::InvalidSource { reason: "id vazio" });
     }
+    // No init_com for webcams (see `enumerate`): MediaFoundation owns COM
+    // setup on its thread, so the grab runs isolated like the enum query —
+    // the Tauri caller thread may already run our MTA COM.
+    if matches!(kind, SourceKind::Camera) {
+        let id = id.to_owned();
+        return std::thread::Builder::new()
+            .name("golive-cam-still".into())
+            .spawn(move || camera::thumbnail_camera(&id))
+            .map_err(|e| PlatformError::Internal(format!("thread de thumbnail: {e}")))?
+            .join()
+            .map_err(|_| PlatformError::Internal("thumbnail da webcam falhou".into()))?;
+    }
+    init_com();
     match kind {
         SourceKind::Display => wgc::thumbnail_display(id).or_else(|_| dxgi::thumbnail_display(id)),
         SourceKind::Window => wgc::thumbnail_window(id),
+        SourceKind::Camera => camera::thumbnail_camera(id),
     }
 }
 
@@ -127,12 +157,20 @@ impl VideoSource for WindowsSource {
         let worker = std::thread::Builder::new()
             .name("golive-wgc".into())
             .spawn(move || {
-                init_com();
+                // MediaFoundation owns COM setup on its thread and refuses
+                // ours (RPC_E_CHANGED_MODE) — the camera worker skips
+                // init_com; the device is opened and used on this thread.
+                if !matches!(info.kind, SourceKind::Camera) {
+                    init_com();
+                }
                 match info.kind {
                     SourceKind::Display => dxgi::run_display(
                         info.id, config, frame_tx, stop_, error_, ready_tx,
                     ),
                     SourceKind::Window => wgc::run_window(
+                        info.id, config, frame_tx, stop_, error_, ready_tx,
+                    ),
+                    SourceKind::Camera => camera::run_camera(
                         info.id, config, frame_tx, stop_, error_, ready_tx,
                     ),
                 }
@@ -164,6 +202,10 @@ impl VideoSource for WindowsSource {
             // DWM composes for concurrent sessions, so windows keep the
             // glitch-free new-first restart.
             SourceKind::Window => RestartOrder::NewFirst,
+            // A webcam reopen races the driver teardown (same-device MF
+            // sources reject a second open while the old one drains), so
+            // cameras stop + join first like DXGI displays.
+            SourceKind::Camera => RestartOrder::StopFirst,
         }
     }
 }

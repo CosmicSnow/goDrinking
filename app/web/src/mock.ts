@@ -121,19 +121,21 @@ export function mockCounters(
   };
 }
 
-/** Fontes mock (1 display + 1 window). */
+/** Fontes mock (1 display + 1 window + 1 webcam). */
 export function mockSources(): SourceInfo[] {
   return [
     { kind: "display", id: "0", name: "Tela principal · 1920×1080", w: 1920, h: 1080 },
     { kind: "window", id: "42", name: "VS Code · goDrinking", w: 1280, h: 800 },
+    { kind: "camera", id: "0", name: "Webcam · 1280×720", w: 1280, h: 720 },
   ];
 }
 
-/** Caps mock (display/window supported). */
+/** Caps mock (display/window/camera supported). */
 export function mockCaps(): CapabilitySet {
   return {
     display: { supported: true, reason: "mock (navegador)" },
     window: { supported: true, reason: "mock (navegador)" },
+    camera: { supported: true, reason: "mock (navegador)" },
     app_audio: { supported: false, reason: "mock: sem áudio mapeado" },
     exclusion: { supported: false, reason: "mock: sem exclusão" },
   };

@@ -19,27 +19,117 @@ pub mod session_log;
 pub mod video;
 
 use golive_core::media::{
-    EngineKind, ExternalSource, MediaEvent, NativeViewer, Publisher, Quality, QualityProfile,
-    VideoSource,
+    EngineKind, ExternalFrame, ExternalSource, MediaEvent, NativeViewer, Publisher, Quality,
+    QualityProfile, VideoSource,
 };
-use golive_platform::AudioApp;
 use golive_core::owner::{Fence, Owner, OwnerSnapshot};
 use golive_core::signal::SignalClient;
+use golive_platform::AudioApp;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use tauri::ipc::{Channel, InvokeResponseBody};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::mpsc;
 
 pub const DEFAULT_SERVER: &str = "https://together.jouymaker.com";
 
+struct StartupCancelGuard {
+    cancel: Arc<AtomicBool>,
+    armed: bool,
+}
+
+impl StartupCancelGuard {
+    fn new(cancel: Arc<AtomicBool>) -> Self {
+        Self {
+            cancel,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for StartupCancelGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancel.store(true, Ordering::Release);
+        }
+    }
+}
+
+async fn start_capture_for_blocking(
+    kind: golive_platform::SourceKind,
+    id: String,
+    profile: QualityProfile,
+    live: Arc<Mutex<QualityProfile>>,
+    cancel: Arc<AtomicBool>,
+) -> Result<
+    (
+        std::sync::mpsc::Receiver<ExternalFrame>,
+        screen::BridgeHandle,
+        String,
+    ),
+    golive_platform::PlatformError,
+> {
+    tokio::task::spawn_blocking(move || {
+        screen::start_capture_for_with_cancel(kind, &id, profile, live, cancel)
+    })
+    .await
+    .map_err(|_| {
+        golive_platform::PlatformError::Internal("inicialização de captura cancelada".into())
+    })?
+}
+
+async fn start_capture_combo_blocking(
+    screen_kind: golive_platform::SourceKind,
+    screen_id: String,
+    camera_id: String,
+    profile: QualityProfile,
+    live: Arc<Mutex<QualityProfile>>,
+    cancel: Arc<AtomicBool>,
+) -> Result<
+    (
+        std::sync::mpsc::Receiver<ExternalFrame>,
+        screen::BridgeHandle,
+        String,
+    ),
+    golive_platform::PlatformError,
+> {
+    tokio::task::spawn_blocking(move || {
+        screen::start_capture_combo_with_cancel(
+            screen_kind,
+            &screen_id,
+            &camera_id,
+            profile,
+            live,
+            cancel,
+        )
+    })
+    .await
+    .map_err(|_| {
+        golive_platform::PlatformError::Internal("inicialização de captura cancelada".into())
+    })?
+}
+
 /// Share source selector. Screen capture arrives via the platform bridge
 /// (`display:<id>` / `window:<id>`); synthetic + movie stay untouched.
+/// `camera:<id>` streams a webcam alone; `combo:display:<id>+camera:<cid>`
+/// (or `combo:window:…`) composites screen + webcam corner overlay into one
+/// feed (single publisher, protocol-unchanged).
 #[derive(Clone, Debug)]
 pub enum ShareSource {
     Synthetic,
     Movie(String),
     Display(String),
     Window(String),
+    Camera(String),
+    Combo {
+        screen: Box<ShareSource>,
+        camera: String,
+    },
 }
 
 pub(crate) fn initial_share_profile(
@@ -47,9 +137,7 @@ pub(crate) fn initial_share_profile(
 ) -> Result<QualityProfile, String> {
     match profile {
         Some(profile) => {
-            profile
-                .validate()
-                .map_err(|e| format!("qualidade: {e}"))?;
+            profile.validate().map_err(|e| format!("qualidade: {e}"))?;
             Ok(profile)
         }
         None => Ok(Quality::P720.profile()),
@@ -59,6 +147,7 @@ pub(crate) fn initial_share_profile(
 pub(crate) fn window_audio_id(source: &ShareSource) -> Option<&str> {
     match source {
         ShareSource::Window(id) => Some(id.as_str()),
+        ShareSource::Combo { screen, .. } => window_audio_id(screen),
         _ => None,
     }
 }
@@ -85,9 +174,50 @@ impl ShareSource {
             } else {
                 Ok(Self::Window(id.trim().to_owned()))
             }
+        } else if let Some(id) = raw.strip_prefix("camera:") {
+            if id.trim().is_empty() {
+                Err("camera: needs an id (list sources first)".into())
+            } else {
+                Ok(Self::Camera(id.trim().to_owned()))
+            }
+        } else if let Some(rest) = raw.strip_prefix("combo:") {
+            Self::parse_combo(rest)
         } else {
-            Err("fonte: 'synthetic', 'movie:/caminho', 'display:<id>' ou 'window:<id>'".into())
+            Err("fonte: 'synthetic', 'movie:/caminho', 'display:<id>', 'window:<id>', 'camera:<id>' ou 'combo:display:<id>+camera:<cid>'".into())
         }
+    }
+
+    /// Parses `display:<sid>+camera:<cid>` / `window:<sid>+camera:<cid>`.
+    /// The screen half reuses the single-source rules (OS handles never
+    /// contain `+camera:`); anything else is a typed error, never a guess.
+    fn parse_combo(rest: &str) -> Result<Self, String> {
+        let (screen_part, camera_id) = rest.split_once("+camera:").ok_or_else(|| {
+            "combo: use 'combo:display:<id>+camera:<cid>' ou 'combo:window:<id>+camera:<cid>'"
+                .to_owned()
+        })?;
+        if camera_id.trim().is_empty() {
+            return Err("combo: camera: needs an id (list sources first)".into());
+        }
+        let screen = if let Some(id) = screen_part.strip_prefix("display:") {
+            if id.trim().is_empty() {
+                return Err("combo: display: needs an id (list sources first)".into());
+            }
+            Self::Display(id.trim().to_owned())
+        } else if let Some(id) = screen_part.strip_prefix("window:") {
+            if id.trim().is_empty() {
+                return Err("combo: window: needs an id (list sources first)".into());
+            }
+            Self::Window(id.trim().to_owned())
+        } else {
+            return Err(
+                "combo: a tela é 'display:<id>' ou 'window:<id>' (synthetic/movie/camera não combinam)"
+                    .into(),
+            );
+        };
+        Ok(Self::Combo {
+            screen: Box::new(screen),
+            camera: camera_id.trim().to_owned(),
+        })
     }
 }
 
@@ -149,21 +279,19 @@ pub fn backend_note_for(backend: Option<&str>) -> Option<String> {
         None | Some("videotoolbox") | Some("nvenc") | Some("qsv") | Some("amf") | Some("mfhw") => {
             None
         }
-        Some("openh264") => Some(
-            if cfg!(target_os = "windows") {
-                if std::env::var_os("GOLIVE_DISABLE_HW").is_some() {
-                    "hardware desabilitado (GOLIVE_DISABLE_HW)".to_owned()
-                } else {
-                    "NVENC indisponível — usando OpenH264 (software)".to_owned()
-                }
-            } else if cfg!(not(target_os = "macos")) {
-                "sem aceleração de hardware nesta plataforma".to_owned()
-            } else if std::env::var_os("GOLIVE_DISABLE_HW").is_some() {
+        Some("openh264") => Some(if cfg!(target_os = "windows") {
+            if std::env::var_os("GOLIVE_DISABLE_HW").is_some() {
                 "hardware desabilitado (GOLIVE_DISABLE_HW)".to_owned()
             } else {
-                "probe de hardware falhou — ver log de sessão".to_owned()
-            },
-        ),
+                "NVENC indisponível — usando OpenH264 (software)".to_owned()
+            }
+        } else if cfg!(not(target_os = "macos")) {
+            "sem aceleração de hardware nesta plataforma".to_owned()
+        } else if std::env::var_os("GOLIVE_DISABLE_HW").is_some() {
+            "hardware desabilitado (GOLIVE_DISABLE_HW)".to_owned()
+        } else {
+            "probe de hardware falhou — ver log de sessão".to_owned()
+        }),
         Some(_) => None,
     }
 }
@@ -280,7 +408,8 @@ pub struct E2ePlan {
     /// File where this instance reports JSON status.
     pub status_file: String,
     /// Share source selector ("synthetic" default | "movie:<path>" |
-    /// "display:<id>" | "window:<id>"). Optional so existing plans keep
+    /// "display:<id>" | "window:<id>" | "camera:<id>" |
+    /// "combo:display:<id>+camera:<cid>"). Optional so existing plans keep
     /// working unchanged (absent == synthetic). The viewer ignores it.
     #[serde(default)]
     pub share: Option<String>,
@@ -322,11 +451,12 @@ impl E2ePlan {
             }
             // Early rejection: the host passes this straight to start_share,
             // so a typo here must fail at plan parse, not mid-run.
-            ShareSource::parse(share)
-                .map_err(|e| format!("e2e plan field 'share': {e}"))?;
+            ShareSource::parse(share).map_err(|e| format!("e2e plan field 'share': {e}"))?;
         }
         if let Some(quality) = plan.quality {
-            quality.validate().map_err(|e| format!("e2e quality: {e}"))?;
+            quality
+                .validate()
+                .map_err(|e| format!("e2e quality: {e}"))?;
         }
         Ok(Some(plan))
     }
@@ -382,6 +512,130 @@ struct Inner {
     /// census line went out (log once per process, not per Stats event).
     last_logged_backend: Option<String>,
     census_logged: bool,
+    /// Live modal previews by token (see `preview_start`). Own OS reads,
+    /// independent from share bridges; stopped explicitly (modal close,
+    /// blur, share confirm) and swept on stop_share/leave. Kind + id only.
+    previews: PreviewRegistry,
+    /// Stage self-view sessions by token (see `selfview_start`). Each owns
+    /// its tap-forwarder stop flag; stopped explicitly (tile hide, share
+    /// stop) and swept on stop_share/leave.
+    selfviews: HashMap<String, SelfviewSession>,
+}
+
+/// One stage self-view session: owns the tap-forwarder stop flag so
+/// `selfview_stop` joins promptly instead of stranding a thread in `recv`.
+struct SelfviewSession {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+struct PendingPreview {
+    cancel: Arc<AtomicBool>,
+}
+
+struct ActivePreview {
+    cancel: Arc<AtomicBool>,
+    handle: screen::PreviewHandle,
+}
+
+#[derive(Default)]
+struct PreviewRegistry {
+    pending: HashMap<String, PendingPreview>,
+    active: HashMap<String, ActivePreview>,
+}
+
+impl PreviewRegistry {
+    fn register(&mut self, token: String, cancel: Arc<AtomicBool>) -> bool {
+        if self.pending.contains_key(&token) || self.active.contains_key(&token) {
+            return false;
+        }
+        self.pending.insert(token, PendingPreview { cancel });
+        true
+    }
+
+    fn promote(
+        &mut self,
+        token: &str,
+        cancel: &Arc<AtomicBool>,
+        handle: screen::PreviewHandle,
+    ) -> Result<(), screen::PreviewHandle> {
+        let is_current = self
+            .pending
+            .get(token)
+            .map(|pending| Arc::ptr_eq(&pending.cancel, cancel))
+            .unwrap_or(false);
+        if !is_current || cancel.load(Ordering::Acquire) {
+            return Err(handle);
+        }
+        self.pending.remove(token);
+        self.active.insert(
+            token.to_owned(),
+            ActivePreview {
+                cancel: Arc::clone(cancel),
+                handle,
+            },
+        );
+        Ok(())
+    }
+
+    fn remove_pending(&mut self, token: &str, cancel: &Arc<AtomicBool>) {
+        if self
+            .pending
+            .get(token)
+            .map(|pending| Arc::ptr_eq(&pending.cancel, cancel))
+            .unwrap_or(false)
+        {
+            self.pending.remove(token);
+        }
+    }
+
+    fn is_pending(&self, token: &str, cancel: &Arc<AtomicBool>) -> bool {
+        !cancel.load(Ordering::Acquire)
+            && self
+                .pending
+                .get(token)
+                .map(|pending| Arc::ptr_eq(&pending.cancel, cancel))
+                .unwrap_or(false)
+    }
+
+    fn take(&mut self, token: &str) -> Option<screen::PreviewHandle> {
+        if let Some(pending) = self.pending.remove(token) {
+            pending.cancel.store(true, Ordering::Release);
+        }
+        self.active.remove(token).map(|entry| {
+            entry.cancel.store(true, Ordering::Release);
+            entry.handle
+        })
+    }
+
+    fn is_active(&self, token: &str, cancel: &Arc<AtomicBool>) -> bool {
+        self.active
+            .get(token)
+            .map(|active| Arc::ptr_eq(&active.cancel, cancel) && !cancel.load(Ordering::Acquire))
+            .unwrap_or(false)
+    }
+
+    fn sweep(&mut self) -> Vec<screen::PreviewHandle> {
+        for (_, pending) in self.pending.drain() {
+            pending.cancel.store(true, Ordering::Release);
+        }
+        self.active
+            .drain()
+            .map(|(_, active)| {
+                active.cancel.store(true, Ordering::Release);
+                active.handle
+            })
+            .collect()
+    }
+}
+
+impl SelfviewSession {
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
 }
 
 /// Decode-side observation for one watched member.
@@ -391,6 +645,83 @@ pub struct LinkTrack {
     pub decoded: u64,
     pub w: u32,
     pub h: u32,
+}
+
+/// Replacement gap: how long a self-view forwarder waits for the NEW bridge
+/// after its feed disconnects (stop-first restarts, rewatch rebuilds) before
+/// concluding the share ended. Stop-responsive slices; the sweep ends it
+/// immediately on share stop.
+const SELFVIEW_REATTACH_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Self-view feed poll budget: the tile idles here, stop-responsive.
+const SELFVIEW_RECV_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Packs one tap frame as GLP2/format-1 (contiguous I420, player-compatible).
+/// `None` on odd dims or bad length — the forwarder skips the frame instead
+/// of breaking the tile (the frontend rejects odd dims the same way).
+fn pack_selfview_frame(frame: &golive_core::media::I420Frame, seq: u32) -> Option<Vec<u8>> {
+    if frame.w < 2 || frame.h < 2 || frame.w % 2 != 0 || frame.h % 2 != 0 {
+        return None;
+    }
+    if frame.data.len() != frame.w * frame.h * 3 / 2 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(20 + frame.data.len());
+    bytes.extend_from_slice(b"GLP2");
+    bytes.extend_from_slice(&seq.to_le_bytes());
+    bytes.extend_from_slice(&(frame.w as u32).to_le_bytes());
+    bytes.extend_from_slice(&(frame.h as u32).to_le_bytes());
+    bytes.extend_from_slice(&1u32.to_le_bytes());
+    bytes.extend_from_slice(&frame.data);
+    Some(bytes)
+}
+
+/// Stage self-view forwarder: drains the current tap feed, surviving bridge
+/// replacement without frontend action. On feed disconnect it re-resolves the
+/// live bridge's tap (`reattach`; `None` = no share) — immediately, then
+/// across `grace` while the share restarts — and only ends when no bridge
+/// comes back, `stop` fires, or `send` fails. Sequence numbers continue
+/// across reattachment (one tile stream, never restarted).
+fn forward_selfview(
+    mut feed: std::sync::mpsc::Receiver<golive_core::media::I420Frame>,
+    stop: &AtomicBool,
+    grace: std::time::Duration,
+    reattach: &mut dyn FnMut() -> Option<std::sync::mpsc::Receiver<golive_core::media::I420Frame>>,
+    send: &mut dyn FnMut(Vec<u8>) -> bool,
+) {
+    let mut seq = 0u32;
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        match feed.recv_timeout(SELFVIEW_RECV_BUDGET) {
+            Ok(frame) => {
+                if let Some(bytes) = pack_selfview_frame(&frame, seq) {
+                    seq = seq.wrapping_add(1);
+                    if !send(bytes) {
+                        return;
+                    }
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // Bridge replaced (restart/rebuild) or share ended: give the
+                // new bridge its grace, stop-responsive, then conclude.
+                let deadline = std::time::Instant::now() + grace;
+                let mut replacement = reattach();
+                while replacement.is_none() {
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    replacement = reattach();
+                }
+                feed = replacement.expect("reattach just resolved");
+            }
+        }
+    }
 }
 
 impl AppState {
@@ -419,6 +750,8 @@ impl AppState {
                 last_logged_backend: None,
                 census_logged: false,
                 share_source: None,
+                previews: PreviewRegistry::default(),
+                selfviews: HashMap::new(),
             }),
             session_log: Mutex::new(session_log::SessionLog::disabled()),
             operations: tokio::sync::Mutex::new(()),
@@ -586,6 +919,8 @@ impl AppState {
     /// best-effort. Idempotent.
     pub async fn leave(self: &Arc<Self>) -> Result<(), String> {
         let _operation = self.operations.lock().await;
+        self.stop_all_previews();
+        self.stop_all_selfviews();
         let (signal, publishers, viewers, audio) = {
             let mut inner = self
                 .inner
@@ -648,6 +983,17 @@ impl AppState {
         source: &str,
         profile: Option<QualityProfile>,
     ) -> Result<(), String> {
+        self.start_share_with_cancel(app, source, profile, Arc::new(AtomicBool::new(false)))
+            .await
+    }
+
+    async fn start_share_with_cancel(
+        self: &Arc<Self>,
+        app: Option<AppHandle>,
+        source: &str,
+        profile: Option<QualityProfile>,
+        startup_cancel: Arc<AtomicBool>,
+    ) -> Result<(), String> {
         let _operation = self.operations.lock().await;
         let source = ShareSource::parse(source)?;
         let start_profile = initial_share_profile(profile)?;
@@ -660,17 +1006,34 @@ impl AppState {
                 // of them via set_audio_exclusions.
                 audio::ShareAudio::start(golive_platform::default_excluded_tokens()).ok()
             }
+            None if matches!(
+                &source,
+                ShareSource::Combo { screen, .. }
+                    if matches!(screen.as_ref(), ShareSource::Display(_))
+            ) =>
+            {
+                // Combo over a display: same default exclusions as a plain
+                // display share (the webcam has no system-audio tap).
+                audio::ShareAudio::start(golive_platform::default_excluded_tokens()).ok()
+            }
             None => None,
         };
         let audio_rx = share_audio.as_ref().map(|session| session.subscribe());
         // Build the template session BEFORE touching lifecycle (pre-flight):
         // bridge setup may prompt/fail, and a failure must leave no
         // half-started share behind (Starting has no path back to Stopped).
-        let (mut template, mut template_bridge, event_rx) =
-            match Self::build_source_session(&source, start_profile, &live_profile, audio_rx).await {
-                Ok(built) => built,
-                Err(e) => return Err(e),
-            };
+        let (mut template, mut template_bridge, event_rx) = match Self::build_source_session(
+            &source,
+            start_profile,
+            &live_profile,
+            audio_rx,
+            Arc::clone(&startup_cancel),
+        )
+        .await
+        {
+            Ok(built) => built,
+            Err(e) => return Err(e),
+        };
         // From here on, every failure path stops the template pieces.
         // Gate under one short lock (no await inside — a std guard must
         // never cross one); refusals stop the built pieces outside it.
@@ -751,10 +1114,19 @@ impl AppState {
             ShareSource::Movie(_) => "movie",
             ShareSource::Display(_) => "display",
             ShareSource::Window(_) => "window",
+            ShareSource::Camera(_) => "camera",
+            ShareSource::Combo { .. } => "combo",
         };
         let audio_live = {
-            let inner = self.inner.lock().map_err(|_| "state lock poisoned".to_string())?;
-            inner.audio.as_ref().map(|session| session.live()).unwrap_or(false)
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| "state lock poisoned".to_string())?;
+            inner
+                .audio
+                .as_ref()
+                .map(|session| session.live())
+                .unwrap_or(false)
         };
         self.session_log(format!(
             "share start kind={kind} profile={}x{}@{} audio={}",
@@ -774,6 +1146,7 @@ impl AppState {
         profile: QualityProfile,
         live: &Arc<Mutex<QualityProfile>>,
         audio_rx: Option<std::sync::mpsc::Receiver<golive_platform::EncodedAudioPacket>>,
+        startup_cancel: Arc<AtomicBool>,
     ) -> Result<
         (
             Publisher,
@@ -798,12 +1171,14 @@ impl AppState {
                 Resolved::Direct(VideoSource::MovieFile(path.into()))
             }
             ShareSource::Display(id) => {
-                let (rx, bridge, label) = screen::start_capture_for(
+                let (rx, bridge, label) = start_capture_for_blocking(
                     golive_platform::SourceKind::Display,
-                    id,
+                    id.clone(),
                     profile,
                     Arc::clone(live),
+                    Arc::clone(&startup_cancel),
                 )
+                .await
                 .map_err(|e| e.to_string())?;
                 Resolved::Bridged {
                     video: VideoSource::External(ExternalSource { rx, label }),
@@ -811,12 +1186,50 @@ impl AppState {
                 }
             }
             ShareSource::Window(id) => {
-                let (rx, bridge, label) = screen::start_capture_for(
+                let (rx, bridge, label) = start_capture_for_blocking(
                     golive_platform::SourceKind::Window,
-                    id,
+                    id.clone(),
                     profile,
                     Arc::clone(live),
+                    Arc::clone(&startup_cancel),
                 )
+                .await
+                .map_err(|e| e.to_string())?;
+                Resolved::Bridged {
+                    video: VideoSource::External(ExternalSource { rx, label }),
+                    bridge,
+                }
+            }
+            ShareSource::Camera(id) => {
+                let (rx, bridge, label) = start_capture_for_blocking(
+                    golive_platform::SourceKind::Camera,
+                    id.clone(),
+                    profile,
+                    Arc::clone(live),
+                    Arc::clone(&startup_cancel),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+                Resolved::Bridged {
+                    video: VideoSource::External(ExternalSource { rx, label }),
+                    bridge,
+                }
+            }
+            ShareSource::Combo { screen, camera } => {
+                let (screen_kind, screen_id) = match screen.as_ref() {
+                    ShareSource::Display(id) => (golive_platform::SourceKind::Display, id),
+                    ShareSource::Window(id) => (golive_platform::SourceKind::Window, id),
+                    _ => return Err("combo: a tela é display ou window".into()),
+                };
+                let (rx, bridge, label) = start_capture_combo_blocking(
+                    screen_kind,
+                    screen_id.clone(),
+                    camera.clone(),
+                    profile,
+                    Arc::clone(live),
+                    Arc::clone(&startup_cancel),
+                )
+                .await
                 .map_err(|e| e.to_string())?;
                 Resolved::Bridged {
                     video: VideoSource::External(ExternalSource { rx, label }),
@@ -883,25 +1296,31 @@ impl AppState {
                 .share_profile
                 .map(|s| s.profile)
                 .unwrap_or_else(|| Quality::P720.profile());
-            // Display/Window share the stored live Arc; its absence alongside
-            // a capture source is inconsistent — refuse rather than fork it.
+            // Display/Window/Camera/Combo share the stored live Arc; its
+            // absence alongside a capture source is inconsistent — refuse
+            // rather than fork it.
             let live = match &source {
-                ShareSource::Display(_) | ShareSource::Window(_) => {
-                    match inner.share_capture.clone() {
-                        Some(live) => live,
-                        None => return false,
-                    }
-                }
-                ShareSource::Synthetic | ShareSource::Movie(_) => {
-                    Arc::new(Mutex::new(profile))
-                }
+                ShareSource::Display(_)
+                | ShareSource::Window(_)
+                | ShareSource::Camera(_)
+                | ShareSource::Combo { .. } => match inner.share_capture.clone() {
+                    Some(live) => live,
+                    None => return false,
+                },
+                ShareSource::Synthetic | ShareSource::Movie(_) => Arc::new(Mutex::new(profile)),
             };
             let audio_rx = inner.audio.as_ref().map(|session| session.subscribe());
             (source, live, profile, audio_rx)
         };
         // Existing viewers already own a capture/encoder for this share.
         // Fork only transport; the single bridge remains with one live session.
-        let existing = self.inner.lock().ok().and_then(|inner| inner.publishers.values().next().map(|s| s.publisher.clone()));
+        let existing = self.inner.lock().ok().and_then(|inner| {
+            inner
+                .publishers
+                .values()
+                .next()
+                .map(|s| s.publisher.clone())
+        });
         let (publisher, mut bridge, event_rx) = if let Some(existing) = existing {
             let (tx, rx) = mpsc::unbounded_channel();
             match existing.lock().await.fork(None, tx, audio_rx).await {
@@ -909,7 +1328,15 @@ impl AppState {
                 Err(_) => return false,
             }
         } else {
-            match Self::build_source_session(&source, profile, &live, audio_rx).await {
+            match Self::build_source_session(
+                &source,
+                profile,
+                &live,
+                audio_rx,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await
+            {
                 Ok(built) => built,
                 Err(_) => return false,
             }
@@ -987,6 +1414,8 @@ impl AppState {
             ShareSource::Movie(_) => "movie",
             ShareSource::Display(_) => "display",
             ShareSource::Window(_) => "window",
+            ShareSource::Camera(_) => "camera",
+            ShareSource::Combo { .. } => "combo",
         };
         self.session_log(format!("watch fresh kind={kind}"));
         true
@@ -996,6 +1425,8 @@ impl AppState {
     /// deterministically.
     pub async fn stop_share(self: &Arc<Self>) -> Result<(), String> {
         let _operation = self.operations.lock().await;
+        self.stop_all_previews();
+        self.stop_all_selfviews();
         let (publishers, audio) = {
             let mut inner = self
                 .inner
@@ -1078,9 +1509,7 @@ impl AppState {
             bitrate_kbps: args.bitrate_kbps,
             fps: args.fps,
         };
-        profile
-            .validate()
-            .map_err(|e| format!("qualidade: {e}"))?;
+        profile.validate().map_err(|e| format!("qualidade: {e}"))?;
         // Snapshot publishers + previous effective under one short lock;
         // no lock is held across the awaits below.
         let (publishers, previous) = {
@@ -1136,7 +1565,10 @@ impl AppState {
                 .publishers
                 .iter_mut()
                 .filter_map(|(watcher, session)| {
-                    session.bridge.take().map(|bridge| (watcher.clone(), bridge))
+                    session
+                        .bridge
+                        .take()
+                        .map(|bridge| (watcher.clone(), bridge))
                 })
                 .collect(),
             Err(_) => Vec::new(),
@@ -1166,20 +1598,23 @@ impl AppState {
                     // Wedged lock: stop everything taken rather than leak OS
                     // streams with no owner.
                     for (_, mut handle) in bridges {
-                        handle.stop();
+                        let _ = handle.stop();
                     }
                 }
                 return Err(error);
             }
         }
-        let mut effective = EffectiveQuality { profile, generation: previous.generation };
+        let mut effective = EffectiveQuality {
+            profile,
+            generation: previous.generation,
+        };
         {
             if let Ok(mut inner) = self.inner.lock() {
                 if inner.publishers.is_empty() {
                     // Share died mid-switch: stop the (reconfigured) bridges
                     // instead of resurrecting them, report cleanly.
                     for (_, mut handle) in bridges {
-                        handle.stop();
+                        let _ = handle.stop();
                     }
                     return Err("not sharing".into());
                 }
@@ -1278,7 +1713,9 @@ impl AppState {
                 },
             );
             if let Some(signal) = inner.signal.as_ref() {
-                signal.watch(member, true).map_err(|e| format!("watch: {e}"))?;
+                signal
+                    .watch(member, true)
+                    .map_err(|e| format!("watch: {e}"))?;
             } else {
                 return Err("not in a room".into());
             }
@@ -1417,8 +1854,13 @@ impl AppState {
         let kind = match kind {
             "display" => golive_platform::SourceKind::Display,
             "window" => golive_platform::SourceKind::Window,
+            "camera" => golive_platform::SourceKind::Camera,
             _ => {
-                return SourcePreview { data_url: None, w: 0, h: 0 };
+                return SourcePreview {
+                    data_url: None,
+                    w: 0,
+                    h: 0,
+                };
             }
         };
         match screen::preview_source(kind, id) {
@@ -1427,7 +1869,241 @@ impl AppState {
                 w: preview.w,
                 h: preview.h,
             },
-            Err(_) => SourcePreview { data_url: None, w: 0, h: 0 },
+            Err(_) => SourcePreview {
+                data_url: None,
+                w: 0,
+                h: 0,
+            },
+        }
+    }
+
+    /// Starts a live modal preview for one listed source. Returns an opaque
+    /// token; frames flow as GLP2/format-0 (player-compatible) on `channel`
+    /// until `preview_stop`, modal close/blur (frontend), share confirm
+    /// (which stops first, then shares), or stop_share/leave (sweep).
+    /// Own OS reads, independent from share bridges — a busy device (e.g.
+    /// already shared elsewhere) fails typed, never silently.
+    pub fn preview_start(&self, kind: &str, id: &str, channel: Channel) -> Result<String, String> {
+        self.preview_start_with_cancel(kind, id, channel, Arc::new(AtomicBool::new(false)))
+    }
+
+    fn preview_start_with_cancel(
+        &self,
+        kind: &str,
+        id: &str,
+        channel: Channel,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<String, String> {
+        let kind = match kind {
+            "display" => golive_platform::SourceKind::Display,
+            "window" => golive_platform::SourceKind::Window,
+            "camera" => golive_platform::SourceKind::Camera,
+            _ => return Err("preview: fonte é display, window ou camera".into()),
+        };
+        let token = {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            format!(
+                "pv-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            )
+        };
+        {
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| "state lock poisoned".to_string())?;
+            if !inner.previews.register(token.clone(), Arc::clone(&cancel)) {
+                return Err("preview: registro ocupado".into());
+            }
+        }
+        let still_pending = self
+            .inner
+            .lock()
+            .map(|inner| inner.previews.is_pending(&token, &cancel))
+            .unwrap_or(false);
+        if !still_pending {
+            return Err("preview: inicialização cancelada".into());
+        }
+        let (rx, handle) =
+            match screen::start_preview_stream_with_cancel(kind, id, Arc::clone(&cancel)) {
+                Ok(started) => started,
+                Err(error) => {
+                    cancel.store(true, Ordering::Release);
+                    if let Ok(mut inner) = self.inner.lock() {
+                        inner.previews.remove_pending(&token, &cancel);
+                    }
+                    return Err(error.to_string());
+                }
+            };
+        let promoted = match self.inner.lock() {
+            Ok(mut inner) => inner.previews.promote(&token, &cancel, handle),
+            Err(_) => Err(handle),
+        };
+        if let Err(mut stale_handle) = promoted {
+            cancel.store(true, Ordering::Release);
+            let _ = stale_handle.stop();
+            return Err("preview: inicialização cancelada".into());
+        }
+        // Forwarder: packets → GLP2 → Channel; exits when the pump ends
+        // (stop or device failure) or the webview stops receiving. The pump
+        // owns the lifetime (its end drops the channel side); explicit stops
+        // and the stop_share/leave sweep bound everything else.
+        if std::thread::Builder::new()
+            .name("golive-preview-send".into())
+            .spawn(move || {
+                for packet in rx {
+                    if channel
+                        .send(InvokeResponseBody::Raw(packet.glp2_bytes()))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+            .is_err()
+        {
+            self.preview_stop(&token);
+            return Err("preview: sem thread de envio".into());
+        }
+        if !self
+            .inner
+            .lock()
+            .map(|inner| inner.previews.is_active(&token, &cancel))
+            .unwrap_or(false)
+        {
+            self.preview_stop(&token);
+            return Err("preview: inicialização cancelada".into());
+        }
+        // Milestone: kind only (never ids).
+        let kind_name = match kind {
+            golive_platform::SourceKind::Display => "display",
+            golive_platform::SourceKind::Window => "window",
+            golive_platform::SourceKind::Camera => "camera",
+        };
+        self.session_log(format!("preview start kind={kind_name}"));
+        Ok(token)
+    }
+
+    /// Stops one live preview. Idempotent; unknown tokens are Ok. Takes the
+    /// handle out of the registry under one short lock and joins it (bounded
+    /// ~2 s) AFTER the lock is released — never a join under the mutex.
+    pub fn preview_stop(&self, token: &str) {
+        let handle = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|mut inner| inner.previews.take(token));
+        if let Some(mut handle) = handle {
+            let _ = handle.stop();
+        }
+    }
+
+    /// Stops every live preview (stop_share/leave sweep).
+    pub fn stop_all_previews(&self) {
+        let handles: Vec<screen::PreviewHandle> = match self.inner.lock() {
+            Ok(mut inner) => inner.previews.sweep(),
+            Err(_) => Vec::new(),
+        };
+        for mut handle in handles {
+            let _ = handle.stop();
+        }
+    }
+
+    /// Attaches to the live share bridge's self-view tap (`None` when
+    /// nothing capturable is shared). One short lock; the self-view
+    /// forwarder calls this on start and on every bridge replacement.
+    fn current_tap(&self) -> Option<std::sync::mpsc::Receiver<golive_core::media::I420Frame>> {
+        let inner = self.inner.lock().ok()?;
+        inner
+            .publishers
+            .values()
+            .find_map(|session| session.bridge.as_ref().map(|bridge| bridge.attach_tap()))
+    }
+
+    /// Starts the stage self-view: mirrors the LIVE share bridge feed into
+    /// `channel` as GLP2/format-1 (contiguous I420, player-compatible) until
+    /// `selfview_stop`, share stop, or leave. No second OS open — the local
+    /// tile reuses the exact frames the encoder gets. Fails honestly when
+    /// nothing is shared (no bridge to tap). Survives bridge replacement
+    /// (quality restarts, rewatch rebuilds): the forwarder re-attaches to
+    /// the new bridge's tap on its own — no frontend resubscribe, no param
+    /// changes.
+    pub fn selfview_start(self: &Arc<Self>, channel: Channel) -> Result<String, String> {
+        let initial = self.current_tap().ok_or_else(|| {
+            let sharing = self
+                .inner
+                .lock()
+                .map(|inner| !inner.publishers.is_empty())
+                .unwrap_or(false);
+            // Sem bridge com share no ar = fonte sem captura (synthetic ou
+            // movie): erro próprio, nunca "inicie o compartilhamento".
+            if sharing {
+                "prévia local só para tela, janela ou webcam".to_string()
+            } else {
+                "inicie o compartilhamento para ver seu vídeo".to_string()
+            }
+        })?;
+        let token = {
+            static NEXT: AtomicU64 = AtomicU64::new(1);
+            format!(
+                "sv-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            )
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_ = Arc::clone(&stop);
+        let state = Arc::clone(self);
+        let thread = std::thread::Builder::new()
+            .name("golive-selfview-send".into())
+            .spawn(move || {
+                let mut reattach = move || state.current_tap();
+                let mut send =
+                    move |bytes: Vec<u8>| channel.send(InvokeResponseBody::Raw(bytes)).is_ok();
+                forward_selfview(
+                    initial,
+                    &stop_,
+                    SELFVIEW_REATTACH_WAIT,
+                    &mut reattach,
+                    &mut send,
+                );
+            })
+            .map_err(|_| "prévia local: sem thread de envio".to_string())?;
+        self.session_log("selfview start".to_string());
+        self.inner
+            .lock()
+            .map_err(|_| "state lock poisoned".to_string())?
+            .selfviews
+            .insert(
+                token.clone(),
+                SelfviewSession {
+                    stop,
+                    thread: Some(thread),
+                },
+            );
+        Ok(token)
+    }
+
+    /// Stops one stage self-view. Idempotent; unknown tokens are Ok.
+    pub fn selfview_stop(&self, token: &str) {
+        let session = match self.inner.lock() {
+            Ok(mut inner) => inner.selfviews.remove(token),
+            Err(_) => None,
+        };
+        if let Some(mut session) = session {
+            session.stop();
+        }
+    }
+
+    /// Stops every stage self-view (stop_share/leave sweep).
+    pub fn stop_all_selfviews(&self) {
+        let sessions: Vec<SelfviewSession> = match self.inner.lock() {
+            Ok(mut inner) => inner.selfviews.drain().map(|(_, s)| s).collect(),
+            Err(_) => Vec::new(),
+        };
+        for mut session in sessions {
+            session.stop();
         }
     }
 
@@ -1440,7 +2116,12 @@ impl AppState {
             .map_err(|_| "state lock poisoned".to_string())
             .map(|inner| {
                 let mut counters = inner.media_counters.clone();
-                counters.presented = inner.video_windows.values().map(|w| w.presented()).sum::<u64>() + inner.players.values().map(|p| p.presented).sum::<u64>();
+                counters.presented = inner
+                    .video_windows
+                    .values()
+                    .map(|w| w.presented())
+                    .sum::<u64>()
+                    + inner.players.values().map(|p| p.presented).sum::<u64>();
                 counters.links = Self::link_stats_locked(&inner);
                 counters.effective = inner.share_profile;
                 counters.backend = Self::encode_backend_locked(&inner);
@@ -1498,12 +2179,20 @@ impl AppState {
             let mut stats = surface.stats.lock().ok()?;
             let now = std::time::Instant::now();
             Some(video::LinkStats {
-                member: member.clone(), title: track.title.clone(), codec: video::LINK_CODEC.into(),
-                width: track.w, height: track.h, decoded: track.decoded, presented: surface.presented,
+                member: member.clone(),
+                title: track.title.clone(),
+                codec: video::LINK_CODEC.into(),
+                width: track.w,
+                height: track.h,
+                decoded: track.decoded,
+                presented: surface.presented,
                 dropped: track.decoded.saturating_sub(surface.presented),
                 render_fps: stats.render_fps(now),
-                bitrate_bps: stats.bitrate_bps(now), bitrate_note: video::BITRATE_NOTE.into(),
-                delay_estimate_ms: None, delay_note: video::DELAY_NOTE.into(), dropped_note: video::DROPPED_NOTE.into(),
+                bitrate_bps: stats.bitrate_bps(now),
+                bitrate_note: video::BITRATE_NOTE.into(),
+                delay_estimate_ms: None,
+                delay_note: video::DELAY_NOTE.into(),
+                dropped_note: video::DROPPED_NOTE.into(),
             })
         }));
         links.sort_by(|a, b| a.member.cmp(&b.member));
@@ -1512,15 +2201,23 @@ impl AppState {
 
     /// Per-link stats for one member (used by the stats event emit).
     pub fn link_stats_for(&self, member: &str) -> Option<video::LinkStats> {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|inner| Self::link_stats_locked(&inner).into_iter().find(|l| l.member == member))
+        self.inner.lock().ok().and_then(|inner| {
+            Self::link_stats_locked(&inner)
+                .into_iter()
+                .find(|l| l.member == member)
+        })
     }
 
     /// Records one decoded frame for a watched member (called from the
     /// `on_frame` present callback: event-driven, never polled).
-    pub fn note_link_frame(&self, member: &str, title: &str, w: u32, h: u32, alive: &std::sync::atomic::AtomicBool) {
+    pub fn note_link_frame(
+        &self,
+        member: &str,
+        title: &str,
+        w: u32,
+        h: u32,
+        alive: &std::sync::atomic::AtomicBool,
+    ) {
         if let Ok(mut inner) = self.inner.lock() {
             if !alive.load(std::sync::atomic::Ordering::Acquire) {
                 return;
@@ -1559,9 +2256,17 @@ impl AppState {
 
     /// Tears down all video windows. Idempotent; bounded.
     pub fn close_all_video_windows(&self) {
-        let members = self.inner.lock().map(|inner| inner.players.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
-        for member in members { self.remove_player(&member); }
-        if let Ok(mut inner) = self.inner.lock() { inner.player_mute_all = false; }
+        let members = self
+            .inner
+            .lock()
+            .map(|inner| inner.players.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        for member in members {
+            self.remove_player(&member);
+        }
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.player_mute_all = false;
+        }
         let mut windows = match self.inner.lock() {
             Ok(mut inner) => {
                 inner.video_feeds.clear();
@@ -1606,8 +2311,7 @@ impl AppState {
         let path = std::path::Path::new(&plan.status_file);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("e2e status dir: {e}"))?;
+                std::fs::create_dir_all(parent).map_err(|e| format!("e2e status dir: {e}"))?;
             }
         }
         std::fs::write(path, payload).map_err(|e| format!("e2e status write: {e}"))?;
@@ -1662,7 +2366,7 @@ fn restore_bridges(inner: &mut Inner, bridges: Vec<(String, screen::BridgeHandle
                 session.bridge = Some(handle);
             }
             _ => {
-                handle.stop();
+                let _ = handle.stop();
             }
         }
     }
@@ -1720,7 +2424,15 @@ async fn start_share(
         }),
         _ => return Err("qualidade inicial incompleta".into()),
     };
-    state.start_share(Some(app), &source, profile).await
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut cancel_guard = StartupCancelGuard::new(Arc::clone(&cancel));
+    let result = state
+        .start_share_with_cancel(Some(app), &source, profile, cancel)
+        .await;
+    if result.is_ok() {
+        cancel_guard.disarm();
+    }
+    result
 }
 
 #[tauri::command]
@@ -1739,12 +2451,23 @@ async fn set_quality(
     preset: Option<String>,
 ) -> Result<EffectiveQuality, String> {
     state
-        .set_quality(Some(app), SetQualityArgs { w, h, bitrate_kbps, fps, preset })
+        .set_quality(
+            Some(app),
+            SetQualityArgs {
+                w,
+                h,
+                bitrate_kbps,
+                fps,
+                preset,
+            },
+        )
         .await
 }
 
 #[tauri::command]
-async fn list_sources(state: State<'_, Arc<AppState>>) -> Result<Vec<screen::ListedSource>, String> {
+async fn list_sources(
+    state: State<'_, Arc<AppState>>,
+) -> Result<Vec<screen::ListedSource>, String> {
     state.list_sources().await
 }
 
@@ -1800,6 +2523,57 @@ async fn preview_source(
 }
 
 #[tauri::command]
+async fn preview_start(
+    state: State<'_, Arc<AppState>>,
+    kind: String,
+    id: String,
+    channel: Channel,
+) -> Result<String, String> {
+    // Device open rendezvouses (camera permission/first frame): never block
+    // the async runtime on it.
+    let owned = Arc::clone(&state);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut cancel_guard = StartupCancelGuard::new(Arc::clone(&cancel));
+    let result = tokio::task::spawn_blocking(move || {
+        owned.preview_start_with_cancel(&kind, &id, channel, cancel)
+    })
+    .await
+    .map_err(|e| format!("preview: {e}"))?;
+    if result.is_ok() {
+        cancel_guard.disarm();
+    }
+    result
+}
+
+#[tauri::command]
+async fn preview_stop(state: State<'_, Arc<AppState>>, token: String) -> Result<(), String> {
+    // Stopping joins the worker (bounded ~2 s): never on the synchronous
+    // UI-command path — the token shape is unchanged, and stops stay
+    // idempotent (unknown tokens are Ok).
+    let owned = Arc::clone(&state);
+    let _ = tokio::task::spawn_blocking(move || owned.preview_stop(&token)).await;
+    Ok(())
+}
+
+#[tauri::command]
+async fn selfview_start(
+    state: State<'_, Arc<AppState>>,
+    channel: Channel,
+) -> Result<String, String> {
+    // Attaching the tap is instant (no device open), but keep the async
+    // shape for forward-compatibility with the preview commands.
+    let owned = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || owned.selfview_start(channel))
+        .await
+        .map_err(|e| format!("prévia local: {e}"))?
+}
+
+#[tauri::command]
+fn selfview_stop(state: State<'_, Arc<AppState>>, token: String) {
+    state.selfview_stop(&token);
+}
+
+#[tauri::command]
 fn get_media_counters(state: State<'_, Arc<AppState>>) -> Result<MediaCounters, String> {
     state.get_media_counters()
 }
@@ -1832,7 +2606,9 @@ pub fn run_with(state: Arc<AppState>) {
         .plugin(tauri_plugin_opener::init())
         .manage(state)
         .setup(move |app| {
-            if let Ok(mut inner) = log_state.inner.lock() { inner.desktop = Some(app.handle().clone()); }
+            if let Ok(mut inner) = log_state.inner.lock() {
+                inner.desktop = Some(app.handle().clone());
+            }
             match app.path().app_log_dir() {
                 Ok(dir) => log_state.set_session_log(session_log::SessionLog::init_in(&dir)),
                 Err(e) => eprintln!("golive: log dir unavailable: {e}"),
@@ -1863,6 +2639,10 @@ pub fn run_with(state: Arc<AppState>) {
             get_snapshot,
             get_roster,
             preview_source,
+            preview_start,
+            preview_stop,
+            selfview_start,
+            selfview_stop,
             get_media_counters,
             set_server,
             get_e2e_plan,
@@ -1926,10 +2706,24 @@ mod e2e_plan_tests {
     #[test]
     fn e2e_quality_is_optional_and_validated() {
         let mut raw: serde_json::Value = serde_json::from_str(PLAN).unwrap();
-        assert_eq!(E2ePlan::from_args(args(&["--e2e-plan", PLAN])).unwrap().unwrap().quality, None);
+        assert_eq!(
+            E2ePlan::from_args(args(&["--e2e-plan", PLAN]))
+                .unwrap()
+                .unwrap()
+                .quality,
+            None
+        );
         raw["quality"] = serde_json::json!({"w":1920,"h":1080,"bitrate_kbps":6000,"fps":60});
         let encoded = raw.to_string();
-        assert_eq!(E2ePlan::from_args(args(&["--e2e-plan", &encoded])).unwrap().unwrap().quality.unwrap().fps, 60);
+        assert_eq!(
+            E2ePlan::from_args(args(&["--e2e-plan", &encoded]))
+                .unwrap()
+                .unwrap()
+                .quality
+                .unwrap()
+                .fps,
+            60
+        );
         raw["quality"]["fps"] = serde_json::json!(0);
         assert!(E2ePlan::from_args(args(&["--e2e-plan", &raw.to_string()])).is_err());
     }
@@ -1988,7 +2782,9 @@ mod e2e_plan_tests {
         let dir = std::env::temp_dir().join("golive-e2e-unit");
         let _ = std::fs::create_dir_all(&dir);
         let status = dir.join("s.json");
-        let mut plan = E2ePlan::from_args(args(&["--e2e-plan", PLAN])).unwrap().unwrap();
+        let mut plan = E2ePlan::from_args(args(&["--e2e-plan", PLAN]))
+            .unwrap()
+            .unwrap();
         plan.status_file = status.to_string_lossy().into_owned();
         let state = AppState::new();
         state.set_e2e_plan(plan).unwrap();
@@ -2002,12 +2798,97 @@ mod e2e_plan_tests {
 }
 
 #[cfg(test)]
+mod preview_command_tests {
+    use super::*;
+    use tauri::ipc::{Channel, InvokeResponseBody};
+
+    #[test]
+    fn preview_start_rejects_unknown_kind_without_touching_os() {
+        let state = Arc::new(AppState::new());
+        assert!(state
+            .preview_start("screen", "1", Channel::new(|_| Ok(())))
+            .is_err());
+        assert!(state
+            .preview_start("", "", Channel::new(|_| Ok(())))
+            .is_err());
+        // Unknown tokens stop silently (idempotent by design).
+        state.preview_stop("pv-nope");
+        state.stop_all_previews();
+    }
+
+    #[test]
+    #[ignore]
+    fn hw_preview_command_streams_glp2_to_channel() {
+        // Real webcam through the Tauri command layer (no webview involved).
+        // Run explicitly, serially (single-open device):
+        // cargo test -p golive-app --lib hw_preview_command -- --ignored --nocapture --test-threads=1
+        use std::time::Duration;
+        let listed = screen::enumerate_sources().expect("real enumerate");
+        let cams: Vec<_> = listed
+            .iter()
+            .filter(|s| s.kind == golive_platform::SourceKind::Camera)
+            .collect();
+        if cams.is_empty() {
+            eprintln!("no camera on this machine; skipping");
+            return;
+        }
+        let state = Arc::new(AppState::new());
+        for cam in cams {
+            // A device may open yet never deliver frames (virtual cameras) —
+            // only received bytes prove a previewable webcam.
+            let (tx_one, rx_one) = std::sync::mpsc::sync_channel::<Vec<u8>>(4);
+            let channel = Channel::new(move |body| {
+                if let InvokeResponseBody::Raw(bytes) = body {
+                    let _ = tx_one.try_send(bytes);
+                }
+                Ok(())
+            });
+            let token = match state.preview_start("camera", &cam.id, channel) {
+                Ok(token) => token,
+                Err(e) => {
+                    eprintln!("preview skipping camera: {e}");
+                    continue;
+                }
+            };
+            let mut frames = Vec::new();
+            let mut live = true;
+            for _ in 0..3 {
+                match rx_one.recv_timeout(Duration::from_secs(12)) {
+                    Ok(bytes) => {
+                        assert!(bytes.len() > 20 && &bytes[..4] == b"GLP2");
+                        frames.push(bytes);
+                    }
+                    Err(e) => {
+                        eprintln!("preview camera without frames: {e}");
+                        live = false;
+                        break;
+                    }
+                }
+            }
+            // Stop is idempotent; the sweep covers the rest.
+            state.preview_stop(&token);
+            state.preview_stop(&token);
+            if live {
+                assert_eq!(frames.len(), 3);
+                state.stop_all_previews();
+                return;
+            }
+        }
+        state.stop_all_previews();
+        panic!("a previewable webcam");
+    }
+}
+
+#[cfg(test)]
 mod share_source_tests {
     use super::*;
 
     #[test]
     fn parses_all_four_kinds() {
-        assert!(matches!(ShareSource::parse("synthetic").unwrap(), ShareSource::Synthetic));
+        assert!(matches!(
+            ShareSource::parse("synthetic").unwrap(),
+            ShareSource::Synthetic
+        ));
         assert!(matches!(
             ShareSource::parse("movie:/tmp/a.mp4").unwrap(),
             ShareSource::Movie(_)
@@ -2020,6 +2901,34 @@ mod share_source_tests {
             ShareSource::parse("window:42").unwrap(),
             ShareSource::Window(_)
         ));
+        assert!(matches!(
+            ShareSource::parse("camera:0").unwrap(),
+            ShareSource::Camera(_)
+        ));
+    }
+
+    #[test]
+    fn parses_combo_screen_plus_camera() {
+        match ShareSource::parse("combo:display:1+camera:0").unwrap() {
+            ShareSource::Combo { screen, camera } => {
+                assert!(matches!(*screen, ShareSource::Display(_)));
+                assert_eq!(camera, "0");
+            }
+            other => panic!("expected combo, got {other:?}"),
+        }
+        match ShareSource::parse("combo:window:42+camera:1").unwrap() {
+            ShareSource::Combo { screen, camera } => {
+                assert!(matches!(*screen, ShareSource::Window(_)));
+                assert_eq!(camera, "1");
+            }
+            other => panic!("expected combo, got {other:?}"),
+        }
+        // Screen half must be display/window; camera id must exist.
+        assert!(ShareSource::parse("combo:camera:0+camera:1").is_err());
+        assert!(ShareSource::parse("combo:synthetic+camera:0").is_err());
+        assert!(ShareSource::parse("combo:display:1+camera:").is_err());
+        assert!(ShareSource::parse("combo:display:1").is_err());
+        assert!(ShareSource::parse("combo:").is_err());
     }
 
     #[test]
@@ -2027,6 +2936,8 @@ mod share_source_tests {
         assert!(ShareSource::parse("display:").is_err());
         assert!(ShareSource::parse("display:   ").is_err());
         assert!(ShareSource::parse("window:").is_err());
+        assert!(ShareSource::parse("camera:").is_err());
+        assert!(ShareSource::parse("camera:   ").is_err());
         assert!(ShareSource::parse("movie:").is_err());
         assert!(ShareSource::parse("screen").is_err());
         assert!(ShareSource::parse("").is_err());
@@ -2036,8 +2947,15 @@ mod share_source_tests {
     fn window_share_uses_window_audio_display_does_not() {
         let window = ShareSource::parse("window:42").unwrap();
         let display = ShareSource::parse("display:\\\\.\\DISPLAY1").unwrap();
+        let camera = ShareSource::parse("camera:0").unwrap();
+        let combo_window = ShareSource::parse("combo:window:42+camera:0").unwrap();
+        let combo_display = ShareSource::parse("combo:display:1+camera:0").unwrap();
         assert_eq!(window_audio_id(&window), Some("42"));
         assert_eq!(window_audio_id(&display), None);
+        assert_eq!(window_audio_id(&camera), None);
+        // Combo inherits the screen half's audio: window taps, display ducks.
+        assert_eq!(window_audio_id(&combo_window), Some("42"));
+        assert_eq!(window_audio_id(&combo_display), None);
         assert_eq!(window_audio_id(&ShareSource::Synthetic), None);
     }
 
@@ -2094,7 +3012,13 @@ mod quality_tests {
     use std::time::Duration;
 
     fn args(w: u32, h: u32, bitrate_kbps: u32, fps: u32) -> SetQualityArgs {
-        SetQualityArgs { w, h, bitrate_kbps, fps, preset: None }
+        SetQualityArgs {
+            w,
+            h,
+            bitrate_kbps,
+            fps,
+            preset: None,
+        }
     }
 
     /// Wire regression: canonical snake_case and legacy camelCase spellings
@@ -2307,17 +3231,24 @@ mod quality_tests {
             .await
             .expect_err("bitrate range rejected");
         assert!(err.starts_with("qualidade:"), "{err}");
-        assert!(state.set_quality(None, args(640, 360, 50, 15)).await.is_err());
-        assert!(state.set_quality(None, args(640, 360, 1000, 0)).await.is_err());
-        assert!(
-            state
-                .set_quality(
-                    None,
-                    SetQualityArgs { preset: Some("ultra".into()), ..args(640, 360, 1000, 15) }
-                )
-                .await
-                .is_err()
-        );
+        assert!(state
+            .set_quality(None, args(640, 360, 50, 15))
+            .await
+            .is_err());
+        assert!(state
+            .set_quality(None, args(640, 360, 1000, 0))
+            .await
+            .is_err());
+        assert!(state
+            .set_quality(
+                None,
+                SetQualityArgs {
+                    preset: Some("ultra".into()),
+                    ..args(640, 360, 1000, 15)
+                }
+            )
+            .await
+            .is_err());
         // Effective tracks the last ACCEPTED profile (odd included); the
         // rejects above left it untouched, and the encoder still runs:
         // a later valid switch applies cleanly.
@@ -2360,7 +3291,11 @@ mod quality_tests {
             .await
             .expect_err("no publishers");
         assert_eq!(err, "not sharing");
-        assert!(state.get_media_counters().expect("counters").effective.is_none());
+        assert!(state
+            .get_media_counters()
+            .expect("counters")
+            .effective
+            .is_none());
     }
 
     #[test]
@@ -2480,19 +3415,28 @@ mod operation_tests {
                 fence: Fence::idle(),
                 viewer: None,
                 adopted: None,
-                alive: alive
-                    .map(|flag| Arc::new(std::sync::atomic::AtomicBool::new(flag))),
+                alive: alive.map(|flag| Arc::new(std::sync::atomic::AtomicBool::new(flag))),
                 remote_ready: false,
                 pending_remote: Vec::new(),
             }
         }
-        assert!(!watch_session_is_dying(&session(None)), "fresh intent is not dying");
-        assert!(!watch_session_is_dying(&session(Some(true))), "live session is not dying");
-        assert!(watch_session_is_dying(&session(Some(false))), "torn-down session is dying");
+        assert!(
+            !watch_session_is_dying(&session(None)),
+            "fresh intent is not dying"
+        );
+        assert!(
+            !watch_session_is_dying(&session(Some(true))),
+            "live session is not dying"
+        );
+        assert!(
+            watch_session_is_dying(&session(Some(false))),
+            "torn-down session is dying"
+        );
     }
 
     #[tokio::test]
-    async fn unwatch_one_host_does_not_wipe_the_other_session_or_counters() {        let state = Arc::new(AppState::new());
+    async fn unwatch_one_host_does_not_wipe_the_other_session_or_counters() {
+        let state = Arc::new(AppState::new());
         {
             let mut inner = state.inner.lock().unwrap();
             let join = inner.owner.begin_join().unwrap();
@@ -2523,10 +3467,230 @@ mod operation_tests {
         state.unwatch("host-a").await.unwrap();
         let inner = state.inner.lock().unwrap();
         let other = inner.viewers.get("host-b").expect("host-b remains");
-        assert_eq!(other.adopted.as_ref().map(|ids| ids.link.as_str()), Some("host-b"));
+        assert_eq!(
+            other.adopted.as_ref().map(|ids| ids.link.as_str()),
+            Some("host-b")
+        );
         assert!(other.remote_ready);
         assert_eq!(other.pending_remote.len(), 1);
         assert!(inner.media_counters.connected);
         assert_eq!(inner.media_counters.frames, 40);
+    }
+}
+
+#[cfg(test)]
+mod selfview_resubscribe_tests {
+    use super::*;
+
+    fn i420(w: usize, h: usize, fill: u8) -> golive_core::media::I420Frame {
+        golive_core::media::I420Frame {
+            w,
+            h,
+            data: vec![fill; w * h * 3 / 2],
+        }
+    }
+
+    #[test]
+    fn pack_selfview_frame_is_glp2_format1_and_skips_odd() {
+        let bytes = pack_selfview_frame(&i420(4, 2, 7), 9).expect("even packs");
+        assert_eq!(&bytes[..4], b"GLP2");
+        assert_eq!(&bytes[4..8], &9u32.to_le_bytes());
+        assert_eq!(&bytes[8..12], &4u32.to_le_bytes());
+        assert_eq!(&bytes[12..16], &2u32.to_le_bytes());
+        assert_eq!(&bytes[16..20], &1u32.to_le_bytes(), "self-view is I420");
+        assert_eq!(&bytes[20..], vec![7u8; 12].as_slice());
+        // Odd dims and bad lengths skip (frontend rejects odd the same way).
+        assert!(pack_selfview_frame(&i420(3, 2, 0), 0).is_none());
+        let mut bad = i420(4, 2, 0);
+        bad.data.pop();
+        assert!(pack_selfview_frame(&bad, 0).is_none());
+    }
+
+    #[test]
+    fn forwarder_survives_bridge_replacement_with_continuous_seq() {
+        // Bridge 1 delivers one frame, then is replaced: the forwarder picks
+        // up bridge 2's feed on its own, seq continuing (one tile stream).
+        let (tx1, rx1) = std::sync::mpsc::channel();
+        tx1.send(i420(2, 2, 10)).unwrap();
+        drop(tx1);
+        let (tx2, rx2) = std::sync::mpsc::channel();
+        tx2.send(i420(2, 2, 20)).unwrap();
+        drop(tx2);
+        let mut slot = Some(rx2);
+        let mut reattach = move || slot.take();
+        let stop = AtomicBool::new(false);
+        let mut sent = Vec::new();
+        let mut send = |bytes: Vec<u8>| {
+            sent.push(bytes);
+            true
+        };
+        forward_selfview(
+            rx1,
+            &stop,
+            std::time::Duration::from_millis(200),
+            &mut reattach,
+            &mut send,
+        );
+        assert_eq!(sent.len(), 2, "both bridges delivered");
+        assert_eq!(&sent[0][4..8], &0u32.to_le_bytes());
+        assert_eq!(&sent[1][4..8], &1u32.to_le_bytes(), "seq continues");
+        for bytes in &sent {
+            assert_eq!(&bytes[..4], b"GLP2");
+            assert_eq!(&bytes[16..20], &1u32.to_le_bytes());
+        }
+        // Payloads prove the handoff: bridge 1 filled 10s, bridge 2 20s.
+        assert!(sent[0][20..].iter().all(|b| *b == 10));
+        assert!(sent[1][20..].iter().all(|b| *b == 20));
+    }
+
+    #[test]
+    fn forwarder_ends_on_stop_without_a_bridge() {
+        // Share ended (no bridge to reattach) and the tile hid: prompt end,
+        // nothing shipped.
+        let (_tx, rx) = std::sync::mpsc::channel::<golive_core::media::I420Frame>();
+        let stop = AtomicBool::new(true);
+        let mut reattach = || None;
+        let mut sent = Vec::new();
+        let mut send = |bytes: Vec<u8>| {
+            sent.push(bytes);
+            true
+        };
+        forward_selfview(
+            rx,
+            &stop,
+            std::time::Duration::from_secs(5),
+            &mut reattach,
+            &mut send,
+        );
+        assert!(sent.is_empty());
+    }
+
+    #[test]
+    fn forwarder_ends_when_downstream_dies() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(i420(2, 2, 1)).unwrap();
+        let stop = AtomicBool::new(false);
+        let mut reattach = || None;
+        let mut send = |_: Vec<u8>| false;
+        forward_selfview(
+            rx,
+            &stop,
+            std::time::Duration::from_millis(10),
+            &mut reattach,
+            &mut send,
+        );
+    }
+}
+
+#[cfg(test)]
+mod pending_preview_tests {
+    use super::*;
+
+    #[test]
+    fn sweep_cancels_pending_authorization_before_late_grant_can_open() {
+        let registry = Arc::new(Mutex::new(PreviewRegistry::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let token = "pending-preview".to_owned();
+        registry
+            .lock()
+            .unwrap()
+            .register(token.clone(), Arc::clone(&cancel));
+        let (auth_tx, auth_rx) = std::sync::mpsc::channel::<bool>();
+        let opens = Arc::new(AtomicU64::new(0));
+        let previews = Arc::new(AtomicU64::new(0));
+        let worker_registry = Arc::clone(&registry);
+        let worker_cancel = Arc::clone(&cancel);
+        let worker_opens = Arc::clone(&opens);
+        let worker_previews = Arc::clone(&previews);
+        let worker_token = token.clone();
+        let worker = std::thread::spawn(move || {
+            assert!(auth_rx.recv().unwrap());
+            let may_start = worker_registry
+                .lock()
+                .unwrap()
+                .is_pending(&worker_token, &worker_cancel);
+            if !may_start {
+                return;
+            }
+            worker_opens.fetch_add(1, Ordering::Relaxed);
+            worker_previews.fetch_add(1, Ordering::Relaxed);
+        });
+        // Startup is paused at its authorization callback while leave/sweep
+        // removes and cancels the pending registration.
+        let handles = registry.lock().unwrap().sweep();
+        assert!(handles.is_empty());
+        auth_tx.send(true).unwrap(); // delayed grant
+        worker.join().unwrap();
+        assert_eq!(opens.load(Ordering::Relaxed), 0);
+        assert_eq!(previews.load(Ordering::Relaxed), 0);
+        assert!(cancel.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancel_after_readiness_before_promotion_disposes_stale_handle() {
+        let mut registry = PreviewRegistry::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let token = "ready-but-swept".to_owned();
+        registry.register(token.clone(), Arc::clone(&cancel));
+        let handle = screen::preview_handle_for_test(Arc::clone(&cancel));
+        let handles = registry.sweep();
+        assert!(handles.is_empty());
+        let mut stale_handle = match registry.promote(&token, &cancel, handle) {
+            Ok(()) => panic!("swept preview must not become active"),
+            Err(handle) => handle,
+        };
+        // The production caller owns and tears down the rejected handle after
+        // releasing the registry lock.
+        assert!(stale_handle.stop().is_ok());
+        assert!(!registry.is_active(&token, &cancel));
+    }
+
+    #[test]
+    fn take_returns_handle_without_joining_worker() {
+        // take() marks cancel and hands the handle out; the bounded join
+        // happens in stop(), outside any registry lock — take itself must
+        // never block on the worker. The test handle only exits once its
+        // stop flag is set, so a join inside take would hang this test; a
+        // prompt return plus a successful outside stop pins the split.
+        let mut registry = PreviewRegistry::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        registry.register("pv-1".into(), Arc::clone(&cancel));
+        let handle = screen::preview_handle_for_test(Arc::clone(&cancel));
+        registry
+            .promote("pv-1", &cancel, handle)
+            .ok()
+            .expect("promotion");
+        let start = std::time::Instant::now();
+        let mut handle = registry.take("pv-1").expect("handle out");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "take must not join the worker"
+        );
+        assert!(cancel.load(Ordering::Acquire));
+        assert!(!registry.is_active("pv-1", &cancel));
+        assert!(handle.stop().is_ok());
+    }
+
+    #[test]
+    fn sweeping_active_and_pending_previews_cancels_both_and_returns_handles() {
+        let mut registry = PreviewRegistry::default();
+        let active_cancel = Arc::new(AtomicBool::new(false));
+        let active_token = "active".to_owned();
+        registry.register(active_token.clone(), Arc::clone(&active_cancel));
+        let handle = screen::preview_handle_for_test(Arc::clone(&active_cancel));
+        registry
+            .promote(&active_token, &active_cancel, handle)
+            .ok()
+            .expect("promotion");
+        let pending_cancel = Arc::new(AtomicBool::new(false));
+        registry.register("pending".into(), Arc::clone(&pending_cancel));
+        let handles = registry.sweep();
+        assert_eq!(handles.len(), 1);
+        assert!(active_cancel.load(Ordering::Acquire));
+        assert!(pending_cancel.load(Ordering::Acquire));
+        assert!(!registry.is_active(&active_token, &active_cancel));
+        for mut handle in handles {
+            assert!(handle.stop().is_ok());
+        }
     }
 }

@@ -28,6 +28,7 @@ const fn no(reason: &'static str) -> Support {
 pub struct CapabilitySet {
     pub display: Support,
     pub window: Support,
+    pub camera: Support,
     pub app_audio: Support,
     pub exclusion: Support,
 }
@@ -40,6 +41,7 @@ pub const fn capabilities() -> CapabilitySet {
         CapabilitySet {
             display: yes("ScreenCaptureKit (pode pedir permissão no primeiro uso)"),
             window: yes("ScreenCaptureKit (pode pedir permissão no primeiro uso)"),
+            camera: yes("webcam via AVFoundation (pode pedir permissão no primeiro uso)"),
             app_audio: yes("process tap (macOS 14.2+)"),
             exclusion: yes("CATapDescription exclui apps do áudio, sem esconder a janela"),
         }
@@ -49,6 +51,7 @@ pub const fn capabilities() -> CapabilitySet {
         CapabilitySet {
             display: yes("DXGI Desktop Duplication"),
             window: yes("Windows.Graphics.Capture (pode pedir permissão no primeiro uso)"),
+            camera: yes("webcam via MediaFoundation (pode pedir permissão no primeiro uso)"),
             app_audio: yes("WASAPI loopback"),
             exclusion: yes("process loopback exclui cada app marcado"),
         }
@@ -58,6 +61,7 @@ pub const fn capabilities() -> CapabilitySet {
         CapabilitySet {
             display: no("apenas macOS/Windows"),
             window: no("apenas macOS/Windows"),
+            camera: no("apenas macOS/Windows"),
             app_audio: no("apenas macOS/Windows"),
             exclusion: no("apenas macOS/Windows"),
         }
@@ -71,7 +75,7 @@ mod tests {
     #[test]
     fn reasons_are_never_empty() {
         let caps = capabilities();
-        for support in [caps.display, caps.window, caps.app_audio, caps.exclusion] {
+        for support in [caps.display, caps.window, caps.camera, caps.app_audio, caps.exclusion] {
             assert!(!support.reason.is_empty());
         }
     }

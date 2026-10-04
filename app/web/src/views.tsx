@@ -9,7 +9,8 @@
 import { useEffect, useRef, useState } from "react";
 import { version as APP_VERSION } from "../package.json";
 import { StreamPlayer } from "./StreamPlayer";
-import { isTauri, playerMuteAll } from "./api";
+import { PreviewPlayer, SelfViewPlayer, useAppFocus } from "./PreviewPlayer";
+import { isTauri, playerMuteAll, previewStop } from "./api";
 import type { UpdateInfo } from "./update";
 import type {
   AudioApp,
@@ -69,6 +70,18 @@ export function visibleAudioApps(
 export const NICKNAME_STORAGE_KEY = "golive.nickname";
 /** Chave do "Servidor" no localStorage (ausente = DEFAULT_SERVER do App). */
 export const SERVER_STORAGE_KEY = "golive.server";
+/** Chave do tile "Você" no palco ("1" visível / "0" oculto; ausente = visível). */
+export const SELFVIEW_STORAGE_KEY = "golive.selfview";
+
+/** Pref do self-view: visível por padrão; só "0" explícito oculta. */
+export function readSelfviewPref(): boolean {
+  return readStoredSetting(SELFVIEW_STORAGE_KEY) !== "0";
+}
+
+/** Persiste o pref do self-view (silencioso sem storage). */
+export function writeSelfviewPref(visible: boolean): void {
+  writeStoredSetting(SELFVIEW_STORAGE_KEY, visible ? "1" : "0");
+}
 
 /** Leitura segura: SSR/testes sem window e modo privado nunca quebram. */
 export function readStoredSetting(key: string): string | null {
@@ -164,20 +177,46 @@ export function validateCode(code: string): string | null {
 export function validateSource(source: string): string | null {
   const raw = source.trim();
   if (raw === "synthetic") return null;
-  if (raw.startsWith("movie:") && raw.length > "movie:".length) return null;
-  if (raw.startsWith("display:") && raw.length > "display:".length) return null;
-  if (raw.startsWith("window:") && raw.length > "window:".length) return null;
-  return "Fonte: 'synthetic', 'movie:/caminho', 'display:<id>' ou 'window:<id>'.";
+  // Ids opacos: vazio ou só-espaço rejeita (o backend dá trim e recusa).
+  for (const prefix of ["movie:", "display:", "window:", "camera:"] as const) {
+    if (raw.startsWith(prefix)) {
+      const id = raw.slice(prefix.length);
+      if (!id.trim()) return `Fonte: '${prefix}<id>' precisa de um id.`;
+      return null;
+    }
+  }
+  if (raw.startsWith("combo:")) return validateCombo(raw);
+  return "Fonte: 'synthetic', 'movie:/caminho', 'display:<id>', 'window:<id>', 'camera:<id>' ou 'combo:display:<id>+camera:<cid>'.";
+}
+
+/**
+ * Valida `combo:display:<id>+camera:<cid>` / `combo:window:<id>+camera:<cid>`
+ * (espelha `ShareSource::parse_combo` no backend; a tela nunca é
+ * synthetic/movie/camera e o combo nunca aninha).
+ */
+export function validateCombo(raw: string): string | null {
+  const rest = raw.slice("combo:".length);
+  const parts = rest.split("+camera:");
+  if (parts.length !== 2) return "Combo: use 'combo:display:<id>+camera:<cid>'.";
+  const [screen, cameraId] = parts;
+  const screenOk =
+    (screen.startsWith("display:") && screen.slice("display:".length).trim() !== "") ||
+    (screen.startsWith("window:") && screen.slice("window:".length).trim() !== "");
+  if (!screenOk) return "Combo: a tela é 'display:<id>' ou 'window:<id>'.";
+  if (!cameraId || !cameraId.trim()) return "Combo: a webcam precisa de um id.";
+  return null;
 }
 
 /** Tipo da fonte a partir do seletor opaco. Puro e testável. */
-export type SourceKindSelect = "synthetic" | "movie" | "display" | "window";
+export type SourceKindSelect = "synthetic" | "movie" | "display" | "window" | "camera" | "combo";
 
 export function sourceKindOf(source: string): SourceKindSelect {
   const raw = source.trim();
+  if (raw.startsWith("combo:")) return "combo";
   if (raw.startsWith("movie:")) return "movie";
   if (raw.startsWith("display:")) return "display";
   if (raw.startsWith("window:")) return "window";
+  if (raw.startsWith("camera:")) return "camera";
   return "synthetic";
 }
 
@@ -1038,6 +1077,8 @@ export interface RoomProps {
   onRefresh: () => void;
   onLeave: () => void;
   onShare: () => void;
+  /** Tela + webcam num feed só (PiP). Ausente = builds antigas sem combo. */
+  onShareCombo?: (screen: string, cameraId: string) => void;
   onStopShare: () => void;
   onWatch: (id: string) => void;
   onUnwatch: (id: string) => void;
@@ -1186,11 +1227,11 @@ function Tile(props: TileProps) {
 
 export function RoomScreen(props: RoomProps) {
   const {
-    roomCode, snapshot, roster, selfId, selfNickname, watching,
+    roomCode, nickname, snapshot, roster, selfId, selfNickname, watching,
     source, onSource, sources, sourcesError, sourcesDenied = false, caps, onListSources,
     previews, onPreviewsVisible,
     busy, error, lastSignal, lastMedia, quality, linkStats,
-    onRefresh, onLeave, onShare, onStopShare, onWatch, onUnwatch,
+    onRefresh, onLeave, onShare, onShareCombo, onStopShare, onWatch, onUnwatch,
     audioApps = [], audioExcluded = [], onToggleAudioExclude,
     mock = false,
   } = props;
@@ -1218,7 +1259,36 @@ export function RoomScreen(props: RoomProps) {
   const [mutedIds, setMutedIds] = useState<Set<string>>(new Set());
   const [shareOpen, setShareOpen] = useState(false);
   const [txOpen, setTxOpen] = useState(false);
-  const [shareTab, setShareTab] = useState<"screens" | "apps">("screens");
+  const [shareTab, setShareTab] = useState<"screens" | "apps" | "cameras">("screens");
+  // Webcam PiP sobre a tela: id da câmera ("" = só a tela). Limpo ao fechar.
+  const [comboCam, setComboCam] = useState("");
+  // Preview ao vivo: token opaco do backend + último erro (o thumb segue).
+  const [previewToken, setPreviewToken] = useState<string | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  // Abertura do preview em voo: o Compartilhar desabilita até assentar
+  // (a mesma câmera não abre duas vezes — clicar no meio falharia ocupado).
+  const [previewPending, setPreviewPending] = useState(false);
+  const previewPendingRef = useRef(false);
+  const handlePreviewPending = (pending: boolean): void => {
+    previewPendingRef.current = pending;
+    setPreviewPending(pending);
+  };
+  // Tile "Você" no palco: visível por padrão, removível com ícone e
+  // reativável no topo (pref persiste). Espelha o feed do share.
+  const [selfViewPref, setSelfViewPref] = useState(() => readSelfviewPref());
+  const [selfViewError, setSelfViewError] = useState<string | null>(null);
+  const hideSelfView = (): void => {
+    setSelfViewPref(false);
+    writeSelfviewPref(false);
+    say("Seu preview oculto — ative de volta no topo.");
+  };
+  const showSelfView = (): void => {
+    setSelfViewPref(true);
+    writeSelfviewPref(true);
+    say("Seu preview de volta no palco.");
+  };
+  // O preview só roda com a janela do app em foco (pausa fora dela).
+  const appFocused = useAppFocus();
   const [audioQuery, setAudioQuery] = useState("");
   const [audioSoundOnly, setAudioSoundOnly] = useState(false);
   const { toast, show } = useToast();
@@ -1235,7 +1305,10 @@ export function RoomScreen(props: RoomProps) {
     onListSources();
     setShareOpen(true);
   };
-  const closeShare = (): void => setShareOpen(false);
+  const closeShare = (): void => {
+    setShareOpen(false);
+    setComboCam("");
+  };
 
   const handleShareMain = (): void => {
     if (sharing) {
@@ -1248,7 +1321,7 @@ export function RoomScreen(props: RoomProps) {
 
   // Selecionar-confirmar: o clique só seleciona (highlight .sel via `source`);
   // só o botão Compartilhar inicia o share e fecha o modal.
-  const pickSource = (kind: "display" | "window", id: string, name: string): void => {
+  const pickSource = (kind: "display" | "window" | "camera", id: string, name: string): void => {
     onSource(`${kind}:${id}`);
     say(`Fonte escolhida: ${name}. Toque Compartilhar para ir ao ar.`);
   };
@@ -1277,8 +1350,46 @@ export function RoomScreen(props: RoomProps) {
   };
 
   const visibleSources = sources.filter((item) =>
-    shareTab === "screens" ? item.kind === "display" : item.kind === "window",
+    shareTab === "screens"
+      ? item.kind === "display"
+      : shareTab === "apps"
+        ? item.kind === "window"
+        : item.kind === "camera",
   );
+  const cameraSources = sources.filter((item) => item.kind === "camera");
+  // Tela selecionada por extenso (para o combo): só vale display:/window:
+  // com id real — nunca prefixo vazio nem outra fonte.
+  const comboScreen: string | null = (() => {
+    const raw = source.trim();
+    if (raw.startsWith("display:") && raw.slice("display:".length).trim()) return raw;
+    if (raw.startsWith("window:") && raw.slice("window:".length).trim()) return raw;
+    return null;
+  })();
+  // Alvo do preview ao vivo: fonte com id real (tela, janela ou webcam).
+  const previewTarget: { kind: "display" | "window" | "camera"; id: string } | null = (() => {
+    const raw = source.trim();
+    const kinds = ["display", "window", "camera"] as const;
+    for (const kind of kinds) {
+      if (raw.startsWith(`${kind}:`)) {
+        const id = raw.slice(kind.length + 1).trim();
+        if (!id) return null;
+        return { kind, id };
+      }
+    }
+    return null;
+  })();
+  // Compartilhar derruba o preview antes (a mesma câmera não abre duas
+  // vezes): espera a abertura em voo assentar, para o token, e só então
+  // vai ao ar — sem guess, sem "câmera ocupada".
+  const stopPreviewForShare = async (): Promise<void> => {
+    for (let i = 0; i < 200 && previewPendingRef.current; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    const token = previewToken;
+    setPreviewToken(null);
+    if (!token) return;
+    await previewStop(token).catch(() => undefined);
+  };
   // Previews lazy do modal: ao abrir ou trocar de aba/lista, pede os thumbs
   // da aba visível com debounce (o App cacheia por kind:id; sem thumb, o
   // gradiente continua). Callback via ref para não refogar o debounce.
@@ -1353,6 +1464,16 @@ export function RoomScreen(props: RoomProps) {
               <div className="stage-hint">
                 Roda = zoom · Arrastar = mover · Duplo-clique = tela cheia · 0 = restaurar
               </div>
+              {sharing && !selfViewPref ? (
+                <button
+                  type="button"
+                  className="btn ghost small"
+                  onClick={showSelfView}
+                  title="Mostra seu vídeo de novo no palco"
+                >
+                  Mostrar meu vídeo
+                </button>
+              ) : null}
               <button
                 type="button"
                 className="btn ghost small"
@@ -1373,11 +1494,49 @@ export function RoomScreen(props: RoomProps) {
           ) : null}
 
           <section className="stage" aria-label="Transmissões da sala">
-            {othersSharing.length === 0 ? (
+            {(othersSharing.length === 0 && !(sharing && selfViewPref)) ? (
               <div className="empty-stage">Sem transmissões</div>
             ) : (
               <>
                 <div className={roomTilesClassName(!!pinned)} data-hook="tile-grid">
+                  {sharing && selfViewPref ? (
+                    <div key="self" className={stageCellClassName("self", pinnedId)}>
+                      <article
+                        className="tile"
+                        data-hook="tile-self"
+                        tabIndex={0}
+                        aria-label="Sua transmissão (prévia local)"
+                      >
+                        <div className="viewport">
+                          <SelfViewPlayer
+                            active={appFocused}
+                            nickname={nickname}
+                            onError={setSelfViewError}
+                          />
+                        </div>
+                        <div className="badge-live"><i />PRÉVIA</div>
+                        <div className="tile-top">
+                          <span className="name-tag">
+                            {nickname}
+                            <span className="leader">VOCÊ</span>
+                          </span>
+                        </div>
+                        <div className="tile-controls">
+                          <button
+                            type="button"
+                            className="tbtn"
+                            onClick={hideSelfView}
+                            title="Ocultar meu preview do palco"
+                          >
+                            Ocultar
+                          </button>
+                        </div>
+                        {selfViewError ? (
+                          <p className="error" role="alert">{selfViewError}</p>
+                        ) : null}
+                      </article>
+                    </div>
+                  ) : null}
                   {othersSharing.map((member) => <div key={member.id} className={stageCellClassName(member.id, pinnedId)}>
                     <Tile
                       native={!mock}
@@ -1689,6 +1848,13 @@ export function RoomScreen(props: RoomProps) {
             >
               Aplicativos
             </button>
+            <button
+              type="button"
+              className={shareTab === "cameras" ? "tab active" : "tab"}
+              onClick={() => setShareTab("cameras")}
+            >
+              Webcams
+            </button>
           </div>
           <label htmlFor="source-kind">Fonte</label>
           <select
@@ -1699,6 +1865,7 @@ export function RoomScreen(props: RoomProps) {
               if (kind === "synthetic") onSource("synthetic");
               else if (kind === "movie") onSource("movie:");
               else if (kind === "display") onSource("display:");
+              else if (kind === "camera") onSource("camera:");
               else onSource("window:");
             }}
             disabled={busy || sharing}
@@ -1710,6 +1877,9 @@ export function RoomScreen(props: RoomProps) {
             </option>
             <option value="window" disabled={caps !== null && !caps.window.supported}>
               Janela {caps && !caps.window.supported ? `(${caps.window.reason})` : ""}
+            </option>
+            <option value="camera" disabled={caps?.camera != null && !caps.camera.supported}>
+              Webcam {caps?.camera && !caps.camera.supported ? `(${caps.camera.reason})` : ""}
             </option>
           </select>
           {sourceKindOf(source) === "movie" ? (
@@ -1726,10 +1896,14 @@ export function RoomScreen(props: RoomProps) {
               />
             </>
           ) : null}
-          {sourceKindOf(source) === "display" || sourceKindOf(source) === "window" ? (
+          {sourceKindOf(source) === "display" || sourceKindOf(source) === "window" || sourceKindOf(source) === "camera" ? (
             <>
               <label htmlFor="source-pick">
-                {sourceKindOf(source) === "display" ? "Tela" : "Janela"}
+                {sourceKindOf(source) === "display"
+                  ? "Tela"
+                  : sourceKindOf(source) === "window"
+                    ? "Janela"
+                    : "Webcam"}
               </label>
               <select
                 id="source-pick"
@@ -1758,6 +1932,43 @@ export function RoomScreen(props: RoomProps) {
                 A primeira listagem pode pedir permissão ao sistema. Sem permissão,
                 nada é capturado — o erro acima explica como autorizar.
               </p>
+              {comboScreen && cameraSources.length > 0 && onShareCombo ? (
+                <>
+                  <label htmlFor="combo-cam">Webcam junto (canto do vídeo)</label>
+                  <select
+                    id="combo-cam"
+                    value={comboCam}
+                    onChange={(event) => setComboCam(event.target.value)}
+                    disabled={busy || sharing}
+                  >
+                    <option value="">Só a tela</option>
+                    {cameraSources.map((item) => (
+                      <option key={item.id} value={item.id}>
+                        {item.name}
+                      </option>
+                    ))}
+                  </select>
+                </>
+              ) : null}
+            </>
+          ) : null}
+          {previewTarget ? (
+            <>
+              <p className="hint">Pré-visualização ao vivo (só com o app em foco).</p>
+              <PreviewPlayer
+                kind={previewTarget.kind}
+                id={previewTarget.id}
+                active={shareOpen && appFocused}
+                onToken={setPreviewToken}
+                onError={setPreviewError}
+                onPending={handlePreviewPending}
+              />
+              {shareOpen && !appFocused ? (
+                <p className="hint">Pausado — volte ao app para ver o preview.</p>
+              ) : null}
+              {previewError ? (
+                <p className="error" role="alert">{previewError}</p>
+              ) : null}
             </>
           ) : null}
           {sourceKindOf(source) === "synthetic" ? (
@@ -1852,13 +2063,26 @@ export function RoomScreen(props: RoomProps) {
               type="button"
               className="btn primary"
               onClick={() => {
-                onShare();
+                // A mesma câmera não abre duas vezes: o preview cai antes
+                // do share subir (ordem stop-first, como o set_quality).
                 setShareOpen(false);
                 say("Iniciando compartilhamento…");
+                void stopPreviewForShare().then(() => {
+                  if (comboScreen && comboCam && onShareCombo) {
+                    onShareCombo(comboScreen, comboCam);
+                  } else {
+                    onShare();
+                  }
+                });
               }}
-              disabled={busy}
+              disabled={busy || previewPending}
+              title={
+                previewPending
+                  ? "Aguardando o preview liberar a câmera…"
+                  : "Inicia o compartilhamento da fonte escolhida"
+              }
             >
-              {busy ? "Iniciando…" : "Compartilhar"}
+              {busy ? "Iniciando…" : comboScreen && comboCam ? "Compartilhar tela + webcam" : "Compartilhar"}
             </button>
           </div>
         </div>

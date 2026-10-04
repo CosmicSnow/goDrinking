@@ -3,7 +3,7 @@ name = "golive-platform-macos"
 version = "0.7.5"
 edition = "2021"
 license = "PolyForm-Noncommercial-1.0.0"
-description = "goDrinking macOS capture backend (ScreenCaptureKit). macOS only; the pure contract lives in golive-platform."
+description = "goDrinking macOS capture backend (ScreenCaptureKit + webcam). macOS only; the pure contract lives in golive-platform."
 
 [lib]
 name = "golive_platform_macos"
@@ -21,6 +21,7 @@ objc2-foundation = { version = "0.3", features = [
     "NSValue",
     "NSUUID",
     "NSProcessInfo",
+    "NSOperation",
 ] }
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std",
@@ -53,6 +54,23 @@ dispatch2 = { version = "0.3", features = ["objc2"] }
 objc2-core-foundation = "0.3"
 objc2-video-toolbox = "0.3"
 libc = "0.2"
+# Webcam capture is a native AVFoundation delegate pipeline. Keep the session
+# and every AVFoundation object on its owner thread; only copied BGRA crosses
+# the callback boundary.
+objc2-av-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "AVCaptureDevice",
+    "AVCaptureInput",
+    "AVCaptureOutputBase",
+    "AVCaptureSession",
+    "AVCaptureSessionPreset",
+    "AVCaptureVideoDataOutput",
+    "AVMediaFormat",
+    "block2",
+    "dispatch2",
+    "objc2-core-media",
+    "objc2-core-video",
+] }
 
 [dev-dependencies]
 openh264 = "0.9"

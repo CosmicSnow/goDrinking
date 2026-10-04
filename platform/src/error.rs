@@ -4,6 +4,10 @@
 /// Copy shown when the OS denies capture. Points at the exact Settings page.
 pub const PERMISSION_HINT: &str = "Sem permissão de Gravação de Tela — autorize em Ajustes → Privacidade e Segurança → Gravação de Tela e tente de novo.";
 
+/// Copy shown when Windows denies capture. Points at Settings, never at a title.
+pub const CAMERA_PERMISSION_HINT: &str =
+    "Sem permissão de Câmera — autorize em Configurações → Privacidade e segurança → Câmera e tente de novo.";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PlatformError {
     /// OS denied capture (or hid every source, which is how denial looks).
@@ -24,6 +28,10 @@ pub enum PlatformError {
 impl PlatformError {
     pub fn permission_denied() -> Self {
         Self::PermissionDenied { hint: PERMISSION_HINT }
+    }
+
+    pub fn camera_permission_denied() -> Self {
+        Self::PermissionDenied { hint: CAMERA_PERMISSION_HINT }
     }
 }
 

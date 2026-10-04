@@ -687,8 +687,8 @@ export default function App() {
     pump();
   };
 
-  const handleShare = (): void => {
-    const sourceError = validateSource(source);
+  const runShare = (descriptor: string): void => {
+    const sourceError = validateSource(descriptor);
     if (sourceError) {
       setError(sourceError);
       return;
@@ -718,9 +718,33 @@ export default function App() {
       if ("error" in intent) {
         throw new Error(intent.error);
       }
-      await startShare(source.trim(), intent.profile);
+      await startShare(descriptor.trim(), intent.profile);
       setEffective({ profile: intent.profile, generation: 0 });
     });
+  };
+
+  const handleShare = (): void => {
+    runShare(source);
+  };
+
+  /**
+   * Tela + webcam num feed só (PiP). O descritor `combo:<tela>+camera:<id>`
+   * é validado aqui; o backend compõe e publica como um share comum
+   * (o viewer vê sem protocolo novo).
+   */
+  const handleShareCombo = (screen: string, cameraId: string): void => {
+    const screenTrimmed = screen.trim();
+    const cameraTrimmed = cameraId.trim();
+    const screenTag = screenTrimmed.startsWith("display:")
+      ? screenTrimmed
+      : screenTrimmed.startsWith("window:")
+        ? screenTrimmed
+        : null;
+    if (!screenTag || !cameraTrimmed) {
+      setError("Combo: escolha a tela e a webcam.");
+      return;
+    }
+    runShare(`combo:${screenTag}+camera:${cameraTrimmed}`);
   };
 
   const handleStopShare = (): void => {
@@ -989,6 +1013,7 @@ export default function App() {
       onRefresh={() => void refresh()}
       onLeave={handleLeave}
       onShare={handleShare}
+      onShareCombo={handleShareCombo}
       onStopShare={handleStopShare}
       onWatch={handleWatch}
       onUnwatch={handleUnwatch}

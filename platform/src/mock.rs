@@ -32,6 +32,20 @@ impl MockSource {
         }
     }
 
+    pub fn camera(id: &str, w: u32, h: u32) -> Self {
+        Self {
+            info: SourceInfo {
+                kind: SourceKind::Camera,
+                id: id.into(),
+                name: format!("Mock webcam {id}"),
+                w,
+                h,
+            },
+            frames: Vec::new(),
+            fail_after: None,
+        }
+    }
+
     pub fn with_solid_frame(mut self, r: u8, g: u8, b: u8) -> Self {
         let (w, h) = (self.info.w.max(2), self.info.h.max(2));
         let mut data = vec![0u8; (w * h * 4) as usize];
@@ -155,6 +169,20 @@ mod tests {
         let list = MockSource::enumerate().unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].kind, SourceKind::Display);
+    }
+
+    #[test]
+    fn camera_mock_opens_and_streams_like_any_kind() {
+        let info = MockSource::camera("cam-0", 64, 64).info;
+        assert_eq!(info.kind, SourceKind::Camera);
+        let mut source = MockSource::open(&info).unwrap();
+        source.frames = vec![MockSource::camera("x", 64, 64)
+            .with_solid_frame(10, 20, 30)
+            .frames
+            .remove(0)];
+        let frames = drive_lifecycle(source, 2).unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!((frames[0].w, frames[0].h), (64, 64));
     }
 
     #[test]

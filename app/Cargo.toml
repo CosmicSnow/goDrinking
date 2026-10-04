@@ -1,6 +1,6 @@
 [package]
 name = "golive-app"
-version = "0.7.15"
+version = "0.7.21"
 edition = "2021"
 default-run = "goDrinking"
 license = "PolyForm-Noncommercial-1.0.0"
@@ -49,6 +49,8 @@ cpal = "0.15"
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net"] }
 ureq = { version = "3", features = ["json"] }
+# Integration tests name capture kinds (camera contention flow).
+golive-platform = { path = "../platform" }
 
 # macOS capture backend (ScreenCaptureKit). Target-gated: other platforms
 # build the shell without it (capabilities report accordingly).

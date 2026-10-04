@@ -32,7 +32,7 @@ pub use audio::{
 };
 pub use capability::{capabilities, CapabilitySet, Support};
 pub use convert::{bgra_to_i420, convert_error, ConvertError};
-pub use error::{PlatformError, PERMISSION_HINT};
+pub use error::{PlatformError, CAMERA_PERMISSION_HINT, PERMISSION_HINT};
 pub use traits::{FrameStream, NextError, RestartOrder, VideoSource};
 pub use types::{capture_config_for, BgraFrame, CaptureConfig, CapturePacket, GpuPixelBuffer, PixelFormat, PlanarYuv, SourceInfo, SourceKind};
 

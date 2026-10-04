@@ -8,7 +8,9 @@
  * - join_room {code, nickname, password} -> string (nosso member id)
  * - leave {} -> ()
  * - start_share {source, w?, h?, bitrateKbps?, fps?} -> ()
- *   ("synthetic", "movie:/caminho", "display:<id>", "window:<id>");
+ *   ("synthetic", "movie:/caminho", "display:<id>", "window:<id>",
+ *   "camera:<id>", "combo:display:<id>+camera:<cid>" ou
+ *   "combo:window:<id>+camera:<cid>" = tela + webcam no canto, um feed só);
  *   perfil opcional (senão 720p30)
  * - stop_share {} -> ()
  * - set_quality {w, h, bitrate_kbps, fps, preset?} -> {profile, generation}
@@ -284,7 +286,7 @@ export function setServer(base: string): Promise<string> {
 
 /** Uma fonte capturável listada pelo backend. */
 export interface SourceInfo {
-  kind: "display" | "window";
+  kind: "display" | "window" | "camera";
   id: string;
   name: string;
   w: number;
@@ -309,6 +311,11 @@ export interface Support {
 export interface CapabilitySet {
   display: Support;
   window: Support;
+  /**
+   * Webcam (opcional: backends antigos não emitem — a UI trata ausente
+   * como desconhecido e libera a opção; o backend valida de verdade).
+   */
+  camera?: Support;
   app_audio: Support;
   exclusion: Support;
 }
@@ -325,6 +332,44 @@ export function listSources(): Promise<SourceInfo[]> {
  */
 export function previewSource(kind: string, id: string): Promise<SourcePreview> {
   return invoke<SourcePreview>("preview_source", { kind, id });
+}
+
+/** Fonte pré-visualizável ao vivo (modal Compartilhar). */
+export type PreviewKind = "display" | "window" | "camera";
+
+/**
+ * Inicia o preview ao vivo de uma fonte listada. Devolve um token opaco;
+ * frames GLP2/format-0 chegam no `channel` até `previewStop(token)`.
+ * Erra tipado (permissão, fonte sumida, câmera ocupada) — nunca silencioso.
+ */
+export function previewStart(
+  kind: PreviewKind,
+  id: string,
+  channel: import("@tauri-apps/api/core").Channel<ArrayBuffer>,
+): Promise<string> {
+  return invoke<string>("preview_start", { kind, id, channel });
+}
+
+/** Para um preview ao vivo. Idempotente; token desconhecido é Ok. */
+export function previewStop(token: string): Promise<void> {
+  return invoke<void>("preview_stop", { token });
+}
+
+/**
+ * Inicia a prévia local do share ATIVO (tile "Você" no palco). Espelha o
+ * feed do bridge — sem segunda abertura de dispositivo. Devolve token;
+ * frames GLP2/format-1 chegam no `channel` até `selfviewStop(token)`.
+ * Erra honesto sem share ("inicie o compartilhamento…").
+ */
+export function selfviewStart(
+  channel: import("@tauri-apps/api/core").Channel<ArrayBuffer>,
+): Promise<string> {
+  return invoke<string>("selfview_start", { channel });
+}
+
+/** Para a prévia local. Idempotente; token desconhecido é Ok. */
+export function selfviewStop(token: string): Promise<void> {
+  return invoke<void>("selfview_stop", { token });
 }
 
 /** Capacidades sem tocar no SO (nunca pede permissão). */
